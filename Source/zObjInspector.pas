@@ -439,6 +439,10 @@ type
     function IsValueNoDefault(QualifiedName: String; Value: String): Boolean;
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
+    /// <summary> The object being inspected. A TzObjectHost assigned here is owned by
+    /// the inspector: it is freed when Component is replaced or set to nil, and when
+    /// the inspector is freed. Any other object is not owned.
+    /// </summary>
     property Component: TObject read FComponent write SetComponent;
     // property ComponentRoot: TCustomForm read GetComponentRoot;
     property ComponentClassType: TClass read FComponentClassType;
@@ -1377,6 +1381,10 @@ begin
   if Assigned(FDefPropValue) then
     FreeAndNil(FDefPropValue);
   FContext.Free;
+  { A TzObjectHost assigned to Component is owned by the inspector: SetComponent
+    frees it when it is replaced, and it used to leak when the inspector went first. }
+  if FComponent is TzObjectHost then
+    FreeAndNil(FComponent);
 end;
 
 procedure TzObjInspectorBase.EndUpdate;
