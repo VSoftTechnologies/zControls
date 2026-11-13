@@ -182,22 +182,41 @@ type
 {$IFDEF CUSTOMFLOATCONV}
     FFormatOptions: TFloatFormatOptions;
 {$ENDIF}
-  public
-    procedure Assign(Source: TPersistent); override;
-  published
-    property MaxDigits: Integer read FMaxDigits write FMaxDigits;
-    property ExpPrecision: Integer read FExpPrecision write FExpPrecision;
+    FOnChange: TNotifyEvent;
+    procedure Changed;
+    procedure SetExpPrecision(const Value: Integer);
+    procedure SetMaxDigits(const Value: Integer);
 {$IFDEF CUSTOMFLOATCONV}
-    property FormatOptions: TFloatFormatOptions read FFormatOptions write FFormatOptions;
+    procedure SetFormatOptions(const Value: TFloatFormatOptions);
+{$ENDIF}
+  public
+    /// <summary> Creates the settings with the default values.
+    /// </summary>
+    constructor Create;
+    procedure Assign(Source: TPersistent); override;
+    /// <summary> Called when a setting changes; the inspector that owns the settings
+    /// uses it to show the values again.
+    /// </summary>
+    property OnChange: TNotifyEvent read FOnChange write FOnChange;
+  published
+    property MaxDigits: Integer read FMaxDigits write SetMaxDigits;
+    property ExpPrecision: Integer read FExpPrecision write SetExpPrecision;
+{$IFDEF CUSTOMFLOATCONV}
+    property FormatOptions: TFloatFormatOptions read FFormatOptions write SetFormatOptions;
 {$ENDIF}
   end;
 
   TzCustomValueManager = class
   private
-    class var FloatPreference: TzFloatPreference;
+    { Used for an item that does not belong to an inspector. Each inspector has its
+      own settings (TzObjInspectorBase.FloatPreference). }
+    class var FDefaultFloatPreference: TzFloatPreference;
     class constructor Create;
     class destructor Destroy;
   protected
+    /// <summary> The float display settings for the item: those of its inspector.
+    /// </summary>
+    class function GetFloatPreference(const PItem: PPropItem): TzFloatPreference;
     /// <summary> Use custom ListBox .
     /// </summary>
     class function GetListClass(const PItem: PPropItem): TPopupListClass;
@@ -415,10 +434,14 @@ type
     FSaveVisibleItems: TList<String>;
     FExpandedList: TList<String>;
     FPropInstance: TDictionary<String, TObject>;
+    { The category names that category rows index into (TPropItem.CategoryIndex).
+      Rebuilt with the items by UpdateItems; index 0 is DefaultCategoryName. }
     FCategory: TList<String>;
-    FPropsCategory: TDictionary<String, Integer>;
+    { RegisterPropertyInCategory: property name -> category name. Kept until
+      ClearRegisteredCategorys, across component changes. }
+    FPropsCategory: TDictionary<String, String>;
     FCircularLinkProps: TList<String>;
-    FDefPropValue: TDictionary<String, String>;
+    FFloatPreference: TzFloatPreference;
     FOnBeforeAddItem: TPropItemEvent;
     FOnAutoExpandItemOnInit: TPropItemEvent;
     FSortByCategory: Boolean;
@@ -437,6 +460,7 @@ type
     procedure SetObjectVisibility(const Value: TMemberVisibility);
     function GetFloatPreference: TzFloatPreference;
     procedure SetFloatPreference(const Value: TzFloatPreference);
+    procedure FloatPreferenceChanged(Sender: TObject);
   protected
     procedure CreateWnd; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -473,7 +497,21 @@ type
     procedure ClearRegisteredCategorys;
     procedure RegisterPropertyInCategory(const CategoryName: string; const PropertyName: string);
     procedure UpdateProperties(const Repaint: Boolean = False); virtual;
-    function IsValueNoDefault(QualifiedName: String; Value: String): Boolean;
+    /// <summary> Whether the item's value is not its default: what the Delphi IDE
+    /// shows in bold, because it would be written to a form file. A property that is
+    /// not stored, or is read-only, is never non-default. Otherwise it is non-default
+    /// when it differs from the declared default; with no default declared, an
+    /// ordinal, set or Int64 is always non-default, and a string or float when not
+    /// empty or zero. A component reference is non-default when assigned, an event
+    /// when it has a handler; an owned object such as Font never is (its own
+    /// properties are). A set element compares with the same element of the default
+    /// set (an empty set when there is no default).
+    /// </summary>
+    function IsItemNonDefault(PItem: PPropItem): Boolean; virtual;
+    /// <summary> IsItemNonDefault for the item with this qualified name. Value is not
+    /// used: this used to mean "changed since the row was first selected".
+    /// </summary>
+    function IsValueNoDefault(QualifiedName: String; Value: String): Boolean; deprecated 'Use IsItemNonDefault';
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
     /// <summary> The object being inspected. A TzObjectHost assigned here is owned by
@@ -496,6 +534,9 @@ type
     property OnBeforeAddItem: TPropItemEvent read FOnBeforeAddItem write FOnBeforeAddItem;
     // visibility of plain object (not descendant of TPersistent)
     property ObjectVisibility: TMemberVisibility read FObjectVisibility write SetObjectVisibility default mvPublic;
+    /// <summary> How float values are shown. Each inspector has its own settings;
+    /// they used to be shared by every inspector in the application.
+    /// </summary>
     property FloatPreference: TzFloatPreference read GetFloatPreference write SetFloatPreference;
     property OnAutoExpandItemOnInit: TPropItemEvent read FOnAutoExpandItemOnInit write FOnAutoExpandItemOnInit;
   end;
@@ -641,10 +682,13 @@ type
     FOnGetItemFriendlyName: TGetItemFriendlyNameEvent;
     FPropsNeedHint: Boolean;
     FValuesNeedHint: Boolean;
-    FPrevHintIndex: Integer;
-    FHintPoint: TPoint;
-    FBoldHint: Boolean;
-    FIsItemHint: Boolean;
+    { Item hints (a cut-off name or value). The text is supplied in CMHintShow; Hint is
+      left alone. While the application has ShowHint off, it is switched on (and
+      ParentShowHint saved) for as long as the mouse is inside. }
+    FHintShowHintForced: Boolean;
+    FHintSavedParentShowHint: Boolean;
+    FHintMouseCell: TRect; // the name or value cell under the mouse
+    FHintShownCell: TRect; // the cell of the last hint the VCL showed
     FShowItemHint: Boolean;
     FSearchText: String;
     FAllowSearch: Boolean;
@@ -655,6 +699,8 @@ type
     procedure WMKILLFOCUS(var Msg: TWMKILLFOCUS); message WM_KILLFOCUS;
     procedure WMSETFOCUS(var Msg: TWMSetFocus); message WM_SETFOCUS;
     procedure CMHintShow(var Message: TCMHintShow); message CM_HINTSHOW;
+    procedure CMMouseLeave(var Message: TMessage); message CM_MOUSELEAVE;
+    procedure RestoreShowHint;
     procedure WMLButtonDown(var Message: TWMLButtonDown); message WM_LBUTTONDOWN;
     procedure WMLButtonUp(var Message: TWMLButtonUp); message WM_LBUTTONUP;
     procedure WMLBUTTONDBLCLK(var Message: TWMLBUTTONDBLCLK); message WM_LBUTTONDBLCLK;
@@ -700,6 +746,15 @@ type
     /// <summary> Shows Msg in the value column of a row whose value can't be read.
     /// </summary>
     procedure PaintValueError(Index: Integer; const Msg: string);
+    /// <summary> The name or value cell at P (client coordinates), or an empty rect
+    /// when there is none or nothing painted was cut off.
+    /// </summary>
+    function HintCellAt(const P: TPoint): TRect;
+    /// <summary> True when the name or value at P is cut off: HintText is the whole
+    /// text, TextRect where it is drawn, Cell the cell it is in.
+    /// </summary>
+    function GetItemHint(const P: TPoint; out HintText: string; out TextRect, Cell: TRect;
+      out Bold: Boolean): Boolean;
     procedure CommitEditor; override;
     procedure DetachEditor; override;
     function DoExpandItem(PItem: PPropItem): Boolean;
@@ -1016,39 +1071,55 @@ begin
 end;
 
 
-function GetEnumOrdValue(const Value: TValue): Integer;
-var
-  vd: TValueData;
-begin
-  Result := 0;
-  vd := TValueData(Value);
-  case Value.TypeData.OrdType of
-    otSByte:
-      Result := vd.FAsSByte;
-    otUByte:
-      Result := vd.FAsUByte;
-    otSWord:
-      Result := vd.FAsSWord;
-    otUWord:
-      Result := vd.FAsUWord;
-    otSLong:
-      Result := vd.FAsSLong;
-    otULong:
-      Result := vd.FAsULong;
-  end;
-end;
-
 function IsValueSigned(const Value: TValue): Boolean;
 begin
   Result := (Value.TypeData.MinValue < 0) or (Value.TypeData.MinInt64Value < 0);
 end;
 
-function SetEnumToBoolean(SetValue, Value: Integer): Boolean;
-var
-  s: TIntegerSet;
+{ A set holds up to 256 elements (32 bytes). Its storage starts at the byte that holds
+  the element type's lowest value, so element E is bit E - ByteOffset * 8. The old code
+  read and wrote sets as a TIntegerSet, which only covers elements 0..31 of a set that
+  starts at byte 0: larger sets showed every element as False, and setting one
+  corrupted the value. }
+function SetElementBit(const Value: TValue; Element: Integer; out Bit: Integer): Boolean;
 begin
-  Integer(s) := SetValue;
-  Result := Value in s;
+  result := False;
+  Bit := -1;
+  if (Value.Kind <> tkSet) or (Value.TypeInfo = nil) then
+    Exit;
+  Bit := Element - ByteOffsetOfSet(Value.TypeInfo) * 8;
+  result := (Bit >= 0) and (Bit < SizeOfSet(Value.TypeInfo) * 8);
+end;
+
+function SetElementIncluded(const Value: TValue; Element: Integer): Boolean;
+var
+  bit: Integer;
+  data: PByte;
+begin
+  result := False;
+  if not SetElementBit(Value, Element, bit) then
+    Exit;
+  data := Value.GetReferenceToRawData;
+  result := (data[bit div 8] and (1 shl (bit mod 8))) <> 0;
+end;
+
+function SetWithElement(const Value: TValue; Element: Integer; Included: Boolean): TValue;
+var
+  bits: array [0 .. 31] of Byte;
+  bit: Integer;
+  mask: Byte;
+begin
+  result := Value;
+  if not SetElementBit(Value, Element, bit) then
+    Exit;
+  FillChar(bits, SizeOf(bits), 0);
+  Value.ExtractRawData(@bits);
+  mask := Byte(1 shl (bit mod 8));
+  if Included then
+    bits[bit div 8] := bits[bit div 8] or mask
+  else
+    bits[bit div 8] := bits[bit div 8] and not mask;
+  TValue.Make(@bits, Value.TypeInfo, result);
 end;
 
 function BooleanToStr(B: Boolean): string;
@@ -1418,9 +1489,10 @@ begin
   FExpandedList := TList<String>.Create;
   FSaveVisibleItems := TList<String>.Create;
   FCircularLinkProps := TList<String>.Create;
-  FDefPropValue := TDictionary<String, String>.Create;
+  FFloatPreference := TzFloatPreference.Create;
+  FFloatPreference.OnChange := FloatPreferenceChanged;
   FCategory := TList<String>.Create;
-  FPropsCategory := TDictionary<String, Integer>.Create;
+  FPropsCategory := TDictionary<String, String>.Create;
   FPropInstance := TDictionary<String, TObject>.Create;
   FWatchedComponents := TList<TComponent>.Create;
   FRebuildPending := False;
@@ -1462,8 +1534,7 @@ begin
     FreeAndNil(FSaveVisibleItems);
   if Assigned(FCircularLinkProps) then
     FreeAndNil(FCircularLinkProps);
-  if Assigned(FDefPropValue) then
-    FreeAndNil(FDefPropValue);
+  FreeAndNil(FFloatPreference);
   FreeAndNil(FHasVisiblePropsCache);
   FreeAndNil(FUsedPropsCache);
   FContext.Free;
@@ -1518,11 +1589,88 @@ begin
   Result := FCircularLinkProps.Contains(PItem^.QualifiedName);
 end;
 
-function TzObjInspectorBase.IsValueNoDefault(QualifiedName, Value: String): Boolean;
+function TzObjInspectorBase.IsItemNonDefault(PItem: PPropItem): Boolean;
+const
+  cNoDefault = Integer($80000000);
+var
+  propInfo: PPropInfo;
+  value: TValue;
+  default: Integer;
+  hasDefault: Boolean;
+  defaultIncluded: Boolean;
+  bit: Integer;
+  raw: Cardinal;
+  obj: TObject;
 begin
-  Result := False;
-  if FDefPropValue.ContainsKey(QualifiedName) then
-    Result := FDefPropValue[QualifiedName] <> Value;
+  { The rule TWriter uses to decide what goes into a form file (see
+    System.Classes.IsDefaultPropertyValue), which is what the IDE shows in bold. This
+    used to mean "changed since the row was first selected", so nothing was shown as
+    non-default until it had been edited. }
+  result := False;
+  if (PItem = nil) or PItem^.IsCategory or (PItem^.Instance = nil) or not (PItem^.Prop is TRttiInstanceProperty) then
+    Exit;
+  propInfo := TRttiInstanceProperty(PItem^.Prop).PropInfo;
+  try
+    if not IsStoredProp(PItem^.Instance, propInfo) then
+      Exit;
+    value := PItem^.Value;
+    { Like TWriter: a read-only property is not written, unless it is a subcomponent. }
+    if propInfo^.SetProc = nil then
+      if not ((value.Kind = tkClass) and (value.AsObject is TComponent) and
+        (csSubComponent in TComponent(value.AsObject).ComponentStyle)) then
+        Exit;
+    default := propInfo^.Default;
+    hasDefault := default <> cNoDefault;
+    case value.Kind of
+      tkInteger, tkChar, tkWChar, tkEnumeration:
+        result := not hasDefault or (Integer(value.AsOrdinal) <> default);
+      tkSet:
+        if PItem^.IsSetElement then
+        begin
+          defaultIncluded := False;
+          if hasDefault and SetElementBit(value, PItem^.SetElementValue, bit) and (bit < 32) then
+            defaultIncluded := (Cardinal(default) and (Cardinal(1) shl bit)) <> 0;
+          result := SetElementIncluded(value, PItem^.SetElementValue) <> defaultIncluded;
+        end
+        else if not hasDefault or (SizeOfSet(value.TypeInfo) > SizeOf(raw)) then
+          result := True
+        else
+        begin
+          raw := 0;
+          value.ExtractRawData(@raw);
+          result := raw <> Cardinal(default);
+        end;
+      tkFloat:
+        result := not hasDefault or (value.AsExtended <> 0);
+      tkInt64:
+        result := not hasDefault or (value.AsInt64 <> default);
+      tkString, tkLString, tkWString, tkUString:
+        result := not hasDefault or (value.AsString <> '');
+      tkClass:
+        begin
+          { A reference to another component is written by name. An owned object such
+            as Font is not shown as non-default itself (TWriter always counts a stored
+            one, so Font, Constraints and Margins would always be): its own properties
+            show what differs. }
+          obj := value.AsObject;
+          result := (obj is TComponent) and not (csSubComponent in TComponent(obj).ComponentStyle) and
+            (TComponent(obj).Name <> '');
+        end;
+      tkMethod:
+        result := TValueData(value).FAsMethod.Code <> nil;
+    end;
+  except
+    { A getter that raises: the row shows the error message instead. }
+    result := False;
+  end;
+end;
+
+function TzObjInspectorBase.IsValueNoDefault(QualifiedName, Value: String): Boolean;
+var
+  index: Integer;
+begin
+  index := FItems.IndexOfQName(QualifiedName);
+  result := (index >= 0) and IsItemNonDefault(FItems.Items[index]);
 end;
 
 function TzObjInspectorBase.ItemNeedUpdate(PItem: PPropItem): Boolean;
@@ -1570,14 +1718,12 @@ begin
 end;
 
 procedure TzObjInspectorBase.RegisterPropertyInCategory(const CategoryName: string; const PropertyName: string);
-var
-  L: Integer;
 begin
-  L := FCategory.IndexOf(CategoryName);
-  if L < 0 then
-    L := FCategory.Add(CategoryName);
+  { Kept until ClearRegisteredCategorys. Every component change used to clear the
+    registrations, so registering before setting Component had no effect. Applied by
+    the next rebuild (UpdateProperties), as before. }
   if not FPropsCategory.ContainsKey(PropertyName) then
-    FPropsCategory.Add(PropertyName, L);
+    FPropsCategory.Add(PropertyName, CategoryName);
 end;
 
 procedure TzObjInspectorBase.BeginUpdate;
@@ -1592,18 +1738,12 @@ end;
 
 procedure TzObjInspectorBase.ClearRegisteredCategorys;
 begin
-  FCategory.Clear;
   FPropsCategory.Clear;
-  FCategory.Add(FDefaultCategoryName);
   UpdateProperties(True);
 end;
 
 procedure TzObjInspectorBase.ComponentChanged;
 begin
-  FCategory.Clear;
-  FCategory.Add(FDefaultCategoryName);
-  FPropsCategory.Clear;
-  FDefPropValue.Clear;
   FCircularLinkProps.Clear;
   { SetComponent has already committed any pending editor text. }
   DetachEditor;
@@ -1662,7 +1802,15 @@ var
     inspecting a host no longer switches SortByCategory on for good. }
   categorised: Boolean;
 
-  function IsCircularLink(P: Pointer; QType: String): Boolean;
+  { Index of a category name in FCategory, which the category rows use. }
+  function CategoryIndex(const AName: string): Integer;
+  begin
+    result := FCategory.IndexOf(AName);
+    if result < 0 then
+      result := FCategory.Add(AName);
+  end;
+
+  function IsCircularLink(AInstance: TObject; QType: String): Boolean;
   var
     LType: TRttiType;
     LPropList: TArray<TRttiProperty>;
@@ -1685,7 +1833,7 @@ var
       end;
     }
     Result := False;
-    LType := FContext.GetType(P);
+    LType := FContext.GetType(AInstance.ClassInfo);
     (* n := Pos('.', QType);
       j := n;
       while n > 0 do
@@ -1705,8 +1853,11 @@ var
     if q = '' then
       Exit(False);
     LPropList := UsedProperties(LType);
+    { Visible as EnumProps shows them: by the object's own rule. This used to ask
+      about LComponent, so for a TPersistent root only published properties were
+      checked, and a cycle through public properties of plain objects was missed. }
     for LProp in LPropList do
-      if IsPropVisible(LProp, LComponent, FObjectVisibility) then
+      if IsPropVisible(LProp, AInstance, FObjectVisibility) then
         if (LProp.PropertyType.TypeKind = tkClass) then
         begin
           s := LProp.PropertyType.ToString;
@@ -1786,11 +1937,10 @@ var
         if (LMultiInstance) and (LComponent <> nil) and (AInstance = LComponent) then
         begin
           LCategoryName := LComponentName;
-          if FCategory.Contains(LCategoryName) then
-            L := FCategory.IndexOf(LCategoryName)
-          else
+          L := CategoryIndex(LCategoryName);
+          if not LCategory.Contains(LCategoryName) then
           begin
-            L := FCategory.Add(LCategoryName);
+            LCategory.Add(LCategoryName);
             PCategory := AddNewCategory;
           end;
         end
@@ -1798,18 +1948,10 @@ var
         begin
           if categorised and (AInstance = LComponent) then
           begin
-            if FPropsCategory.ContainsKey(LProp.Name) then
-            begin
-              L := FPropsCategory[LProp.Name];
-              LCategoryName := FCategory[L];
-              LQName := LCategoryName + '.' + LQName;
-            end
-            else
-            begin
+            if not FPropsCategory.TryGetValue(LProp.Name, LCategoryName) then
               LCategoryName := FDefaultCategoryName;
-              L := 0;
-              LQName := LCategoryName + '.' + LQName;
-            end;
+            L := CategoryIndex(LCategoryName);
+            LQName := LCategoryName + '.' + LQName;
             if not LCategory.Contains(LCategoryName) then
             begin
               LCategory.Add(LCategoryName);
@@ -1853,7 +1995,7 @@ var
             end;
             WatchComponent(LInstance);
             if Assigned(LInstance) then
-              if not IsCircularLink(LInstance.ClassInfo, LQType) then
+              if not IsCircularLink(LInstance, LQType) then
                 EnumProps(LInstance, PItem, PCategory, PItem.FQName, LQType)
               else
                 FCircularLinkProps.Add(LQName);
@@ -1877,6 +2019,9 @@ begin
   DetachEditor;
   FVisibleItems.Clear;
   FItems.Clear;
+  { The category rows index into FCategory, so it is rebuilt with them. }
+  FCategory.Clear;
+  FCategory.Add(FDefaultCategoryName);
   FCircularLinkProps.Clear;
   FPropInstance.Clear;
   { Rebuilt below: every TComponent the items will reference. }
@@ -1895,8 +2040,7 @@ begin
       LObjHost := TzObjectHost(FComponent);
       categorised := True;
       LMultiInstance := True;
-      FCategory.Clear;
-      FPropsCategory.Clear;
+      { This used to clear FPropsCategory too, which lost every registration. }
       for i := 0 to LObjHost.FList.Count - 1 do
       begin
         LComponent := LObjHost.FList[i].Key;
@@ -2134,17 +2278,24 @@ end;
 
 function TzObjInspectorBase.GetFloatPreference: TzFloatPreference;
 begin
-  Result := TzCustomValueManager.FloatPreference;
+  result := FFloatPreference;
 end;
 
 procedure TzObjInspectorBase.SetFloatPreference(const Value: TzFloatPreference);
 begin
   { Copy the settings, as a TPersistent property should. This used to store the
-    caller's object in the class var: the original leaked, and the class destructor
-    freed the caller's object (a double free if the caller freed it too). }
+    caller's object in a class var: the original leaked, and the class destructor
+    freed the caller's object (a double free if the caller freed it too).
+    Assign shows the values again through FloatPreferenceChanged. }
   if Assigned(Value) then
-    TzCustomValueManager.FloatPreference.Assign(Value);
-  UpdateProperties;
+    FFloatPreference.Assign(Value);
+end;
+
+procedure TzObjInspectorBase.FloatPreferenceChanged(Sender: TObject);
+begin
+  { Float values are formatted with these settings, the editor's text included. }
+  if not (csLoading in ComponentState) then
+    UpdateProperties(True);
 end;
 
 { TzObjInspectorList }
@@ -2822,8 +2973,9 @@ begin
     Component := Self;
   FAllowSearch := True;
   FShowItemHint := True;
-  FIsItemHint := False;
-  FBoldHint := False;
+  FHintShowHintForced := False;
+  FHintMouseCell := TRect.Empty;
+  FHintShownCell := TRect.Empty;
   FPropsNeedHint := False;
   FValuesNeedHint := False;
   FOnGetItemReadOnly := nil;
@@ -3378,16 +3530,126 @@ begin
 end;
 
 procedure TzCustomObjInspector.CMHintShow(var Message: TCMHintShow);
+var
+  info: Vcl.Controls.PHintInfo;
+  hintText: string;
+  textRect, cell: TRect;
+  bold: Boolean;
 begin
-  if FIsItemHint and FShowItemHint then
+  { Item hints are supplied here, from the position the VCL asks about. MouseMove used
+    to write them into Hint and toggle ShowHint, which lost the control's own Hint and
+    ShowHint, and it skipped the first row (FPrevHintIndex started at 0). }
+  info := Message.HintInfo;
+  if FShowItemHint and GetItemHint(info^.CursorPos, hintText, textRect, cell, bold) then
   begin
-    Message.HintInfo.HintPos := FHintPoint;
-    Message.HintInfo.HintWindowClass := TItemHintWindow;
-    Message.HintInfo.HintData := Pointer(FBoldHint);
+    info^.HintStr := hintText;
+    info^.HintPos := ClientToScreen(textRect.TopLeft);
+    info^.HintWindowClass := TItemHintWindow;
+    info^.HintData := Pointer(bold);
+    info^.CursorRect := cell; // asked again in the next cell
+    Message.Result := 0;
+  end
+  else if FHintShowHintForced then
+    Message.Result := 1 // ShowHint is only on for the item hints
+  else
+  begin
+    inherited;
+    { The control's own hint. Asked again in the next cell, which may be cut off. }
+    cell := HintCellAt(info^.CursorPos);
+    if FShowItemHint and not cell.IsEmpty then
+      info^.CursorRect := cell;
+  end;
+  if (Message.Result = 0) and (info^.HintStr <> '') then
+    FHintShownCell := info^.CursorRect;
+end;
+
+procedure TzCustomObjInspector.CMMouseLeave(var Message: TMessage);
+begin
+  inherited;
+  FHintMouseCell := TRect.Empty;
+  RestoreShowHint;
+end;
+
+procedure TzCustomObjInspector.RestoreShowHint;
+begin
+  if not FHintShowHintForced then
+    Exit;
+  FHintShowHintForced := False;
+  if FHintSavedParentShowHint then
+    ParentShowHint := True // takes the parent's ShowHint again
+  else
+    ShowHint := False;
+end;
+
+function TzCustomObjInspector.HintCellAt(const P: TPoint): TRect;
+var
+  index: Integer;
+begin
+  result := TRect.Empty;
+  { Set by painting when a name or value did not fit. }
+  if not (FPropsNeedHint or FValuesNeedHint) then
+    Exit;
+  index := GetIndexFromPoint(P);
+  if (index < 0) or FVisibleItems[index]^.IsCategory then
+    Exit;
+  result := ValueRect[index];
+  if not result.Contains(P) then
+  begin
+    result := ItemRect[index];
+    result.Right := FSplitterPos;
+  end;
+end;
+
+function TzCustomObjInspector.GetItemHint(const P: TPoint; out HintText: string; out TextRect, Cell: TRect;
+  out Bold: Boolean): Boolean;
+var
+  index: Integer;
+  PItem: PPropItem;
+  w: Integer;
+begin
+  result := False;
+  HintText := '';
+  TextRect := TRect.Empty;
+  Bold := False;
+  Cell := HintCellAt(P);
+  if Cell.IsEmpty then
+    Exit;
+  index := GetIndexFromPoint(P);
+  PItem := FVisibleItems[index];
+  if ValueRect[index].Contains(P) then
+  begin
+    try
+      TextRect := ValueTextRect[index];
+      HintText := PItem^.ValueName;
+      Bold := FBoldNonDefaultValue and IsItemNonDefault(PItem); // as the value is painted
+    except
+      on E: Exception do
+      begin
+        { the value column shows the getter's error message (see PaintItem) }
+        TextRect := Cell;
+        HintText := E.Message;
+        Bold := False;
+      end;
+    end;
   end
   else
-    inherited;
-  FIsItemHint := False;
+  begin
+    TextRect := PropTextRect[index];
+    if Assigned(FOnGetItemFriendlyName) then
+      HintText := FOnGetItemFriendlyName(Self, PItem) // as the name is painted
+    else
+      HintText := PItem^.Name;
+  end;
+  CanvasStack.Push(Canvas);
+  try
+    Canvas.Font.Assign(Font);
+    if Bold then
+      Canvas.Font.Style := Canvas.Font.Style + [fsBold];
+    w := Canvas.TextWidth(HintText);
+  finally
+    CanvasStack.Pop;
+  end;
+  result := (HintText <> '') and (w >= TextRect.Width);
 end;
 
 procedure TzCustomObjInspector.CMSTYLECHANGED(var Message: TMessage);
@@ -3400,69 +3662,50 @@ end;
 
 procedure TzCustomObjInspector.MouseMove(Shift: TShiftState; X, Y: Integer);
 var
-  Index: Integer;
-  w: Integer;
   P: TPoint;
-  R: TRect;
-  PItem: PPropItem;
-  MustShow: Boolean;
+  cell: TRect;
+  hintText: string;
+  textRect: TRect;
+  bold: Boolean;
+  restart: Boolean;
+  msg: TMessage;
 begin
   inherited;
-  if not FShowItemHint then
+  if (not FShowItemHint) or (csDesigning in ComponentState) then
     Exit;
   P := Point(X, Y);
-  Index := GetIndexFromPoint(P);
-  if (Index > -1) and (FPrevHintIndex <> Index) and (FPropsNeedHint or FValuesNeedHint) then
+  cell := HintCellAt(P);
+  if cell = FHintMouseCell then
+    Exit;
+  FHintMouseCell := cell;
+  if cell.IsEmpty then
+    Exit;
+  restart := False;
+  if not ShowHint then
   begin
-    { Avoid this loop when there is no reason !
-      ==> (FPropsNeedHint or FValuesNeedHint) must be True
-      in order to show hint .
-      ==> Check PaintItem routines !
-    }
-    ShowHint := False;
-    FPrevHintIndex := Index;
-    PItem := FVisibleItems[Index];
-    if PItem^.IsCategory then
+    { The VCL only asks a control for its hint (CM_HINTSHOW) while its ShowHint is
+      True. Switch it on while the mouse is inside; CMMouseLeave restores it. }
+    if not GetItemHint(P, hintText, textRect, cell, bold) then
       Exit;
-    R := ValueRect[Index];
-    FIsItemHint := True;
-    if R.Contains(P) then
-    begin
-      FBoldHint := False;
-      try
-        R := ValueTextRect[Index];
-        Hint := PItem.ValueName;
-      except
-        on E: Exception do
-        begin
-          { the value column shows the getter's error message (see PaintItem) }
-          R := ValueRect[Index];
-          Hint := E.Message;
-        end;
-      end;
-      w := Canvas.TextWidth(Hint);
-      MustShow := R.Width <= w;
-    end
-    else
-    begin
-      R := PropTextRect[Index];
-      Hint := PItem.Name;
-      try
-        FBoldHint := IsValueNoDefault(PItem^.QualifiedName, PItem^.ValueName);
-      except
-        FBoldHint := False;
-      end;
-      w := Canvas.TextWidth(Hint);
-      MustShow := R.Width <= w;
-    end;
-    ShowHint := MustShow;
-    if ShowHint then
-    begin
-      P.X := R.Left;
-      P.Y := R.Top;
-      P := ClientToScreen(P);
-      FHintPoint := P;
-    end;
+    FHintSavedParentShowHint := ParentShowHint;
+    ShowHint := True;
+    FHintShowHintForced := True;
+    restart := True; // the VCL saw this mouse move while ShowHint was still off
+  end
+  else if cell = FHintShownCell then
+  begin
+    { Back in the cell whose hint was shown last. The VCL keeps that cell as the hint's
+      CursorRect until it shows another hint, so it would not ask again. }
+    Application.CancelHint;
+    restart := True;
+  end;
+  if restart then
+  begin
+    msg.Msg := WM_MOUSEMOVE;
+    msg.WParam := 0;
+    msg.LParam := PointToLParam(P);
+    msg.Result := 0;
+    Application.HintMouseMessage(Self, msg);
   end;
 end;
 
@@ -4502,26 +4745,18 @@ begin
 end;
 
 procedure TzPropInspEdit.UpdateEditText;
-var
-  LQName: String;
 begin
   { Nil when no row, or a category row, is selected; DoSetValue calls this for any
     item, including from SetPropValue. }
   if not Assigned(FPropItem) then
     Exit;
-  LQName := FPropItem.FQName;
-  with FInspector do
-  begin
-    FUpdatingText := True;
-    try
-      Self.Text := FPropItem^.ValueName;
-    finally
-      FUpdatingText := False;
-    end;
-    if not FDefPropValue.ContainsKey(LQName) then
-      FDefPropValue.Add(LQName, Self.Text);
-    SelectAll;
+  FUpdatingText := True;
+  try
+    Text := FPropItem^.ValueName;
+  finally
+    FUpdatingText := False;
   end;
+  SelectAll;
 end;
 
 procedure TzPropInspEdit.InitList;
@@ -4795,21 +5030,20 @@ end;
 
 class constructor TzCustomValueManager.Create;
 begin
-  TzCustomValueManager.FloatPreference := TzFloatPreference.Create;
-
-  with TzCustomValueManager.FloatPreference do
-  begin
-    ExpPrecision := cDefaultExpPrecision;
-    MaxDigits := cDefaultMaxDigits;
-{$IFDEF CUSTOMFLOATCONV}
-    FormatOptions := cDefaultFormatOptions;
-{$ENDIF}
-  end;
+  FDefaultFloatPreference := TzFloatPreference.Create;
 end;
 
 class destructor TzCustomValueManager.Destroy;
 begin
-  TzCustomValueManager.FloatPreference.Free;
+  FDefaultFloatPreference.Free;
+end;
+
+class function TzCustomValueManager.GetFloatPreference(const PItem: PPropItem): TzFloatPreference;
+begin
+  if Assigned(PItem) and (PItem^.Insp is TzObjInspectorBase) then
+    result := TzObjInspectorBase(PItem^.Insp).FloatPreference
+  else
+    result := FDefaultFloatPreference;
 end;
 
 class function TzCustomValueManager.DialogCode(const PItem: PPropItem; Dialog:
@@ -4880,19 +5114,12 @@ class function TzCustomValueManager.GetExtraRectResultValue(const PItem: PPropIt
 var
   Value: TValue;
   BoolVal: Boolean;
-  s: TIntegerSet;
-  vOrd: Integer;
 begin
   Value := PItem.Value;
   Result := Value;
   if PItem.IsSetElement then
   begin
-    Integer(s) := GetEnumOrdValue(Value);
-    vOrd := PItem.SetElementValue;
-    if (vOrd in s) then
-      BoolVal := False
-    else
-      BoolVal := True;
+    BoolVal := not SetElementIncluded(Value, PItem.SetElementValue);
     Result := GetValue(PItem, BoolVal);
     Exit;
   end;
@@ -5004,7 +5231,6 @@ end;
 class function TzCustomValueManager.GetValue(const PItem: PPropItem; const Value): TValue;
 var
   Val: TValue;
-  s: TIntegerSet;
 begin
   Result := TValue.Empty;
   Val := PItem.Value;
@@ -5052,20 +5278,29 @@ begin
   end;
 
   if PItem.IsSetElement then
-  begin
-    Integer(s) := GetEnumOrdValue(Val);
-    if Boolean(Value) then
-      Include(s, PItem.SetElementValue)
-    else
-      Exclude(s, PItem.SetElementValue);
-    TValueData(Val).FAsSLong := Integer(s);
-  end
-  else
-  begin
-    if IsValueSigned(Val) then
-      TValueData(Val).FAsSInt64 := Int64(Value)
-    else
-      TValueData(Val).FAsUInt64 := UInt64(Value);
+    Exit(SetWithElement(Val, PItem.SetElementValue, Boolean(Value)));
+  { Read as many bytes as the property type has. This always read 8 bytes, so a
+    caller's Boolean, TColor or (on Win32) TObject variable was read past its end, and
+    whatever followed it went into the value's upper bytes. A caller's variable must
+    be at least as large as the property type. }
+  case Val.Kind of
+    tkInteger, tkEnumeration:
+      case Val.TypeData.OrdType of
+        otSByte:
+          TValueData(Val).FAsSInt64 := ShortInt(Value);
+        otUByte:
+          TValueData(Val).FAsUInt64 := Byte(Value);
+        otSWord:
+          TValueData(Val).FAsSInt64 := SmallInt(Value);
+        otUWord:
+          TValueData(Val).FAsUInt64 := Word(Value);
+        otSLong:
+          TValueData(Val).FAsSInt64 := Integer(Value);
+        otULong:
+          TValueData(Val).FAsUInt64 := Cardinal(Value);
+      end;
+    tkInt64:
+      TValueData(Val).FAsSInt64 := Int64(Value);
   end;
   Result := Val;
 end;
@@ -5129,7 +5364,7 @@ begin
 
   if PItem.IsSetElement then
   begin
-    Result := BooleanToStr(SetEnumToBoolean(GetEnumOrdValue(Value), PItem.SetElementValue));
+    Result := BooleanToStr(SetElementIncluded(Value, PItem.SetElementValue));
     Exit;
   end
   else if (Value.TypeInfo = TypeInfo(Boolean)) then
@@ -5172,7 +5407,7 @@ begin
   end
   else if Value.TypeInfo = TypeInfo(Single) then // Value, not PItem.Value: that calls the getter again
   begin
-    with TzCustomValueManager.FloatPreference do
+    with GetFloatPreference(PItem) do // the item's inspector's settings
 {$IFDEF CUSTOMFLOATCONV}
       Result := MyFormatFloat(TValueData(Value).FAsSingle, MaxDigits, ExpPrecision, FormatOptions);
 {$ELSE}
@@ -5182,7 +5417,7 @@ begin
   end
   else if Value.TypeInfo = TypeInfo(Double) then
   begin
-    with TzCustomValueManager.FloatPreference do
+    with GetFloatPreference(PItem) do // the item's inspector's settings
 {$IFDEF CUSTOMFLOATCONV}
       Result := MyFormatFloat(TValueData(Value).FAsDouble, MaxDigits, ExpPrecision, FormatOptions);
 {$ELSE}
@@ -5192,7 +5427,7 @@ begin
   end
   else if Value.TypeInfo = TypeInfo(Extended) then
   begin
-    with TzCustomValueManager.FloatPreference do
+    with GetFloatPreference(PItem) do // the item's inspector's settings
 {$IFDEF CUSTOMFLOATCONV}
       Result := MyFormatFloat(Value.AsExtended, MaxDigits, ExpPrecision, FormatOptions);
 {$ELSE}
@@ -5319,7 +5554,6 @@ var
   VT: Integer;
   BoolVal: Boolean;
   LInspector: TzCustomObjInspector;
-  LQName: String;
   LColor: TColor;
 begin
 
@@ -5338,7 +5572,7 @@ begin
         vtBool:
           BoolVal := GetValueAs<Boolean>(Value);
         vtSetElement:
-          BoolVal := SetEnumToBoolean(GetEnumOrdValue(Value), PItem.SetElementValue);
+          BoolVal := SetElementIncluded(Value, PItem.SetElementValue);
       end;
       if BoolVal then
         LDetails := LStyle.GetElementDetails(tbCheckBoxCheckedNormal)
@@ -5359,7 +5593,6 @@ begin
     LInspector.CanvasStack.Pop;
   end;
 
-  LQName := PItem^.FQName;
   ValueName := PItem^.ValueName;
 
   LColor := LInspector.FValueColor;
@@ -5368,7 +5601,7 @@ begin
   Canvas.Font.Color := LColor;
 
   Canvas.Font.Style := Canvas.Font.Style - [fsBold];
-  if LInspector.IsValueNoDefault(LQName, ValueName) then
+  if LInspector.IsItemNonDefault(PItem) then
   begin
     if not LInspector.UseStyleColor then
       Canvas.Font.Color := LInspector.FNonDefaultValueColor;
@@ -5844,15 +6077,62 @@ end;
 
 { TzFloatPreference }
 
+constructor TzFloatPreference.Create;
+begin
+  inherited Create;
+  FExpPrecision := cDefaultExpPrecision;
+  FMaxDigits := cDefaultMaxDigits;
+{$IFDEF CUSTOMFLOATCONV}
+  FFormatOptions := cDefaultFormatOptions;
+{$ENDIF}
+end;
+
+procedure TzFloatPreference.Changed;
+begin
+  if Assigned(FOnChange) then
+    FOnChange(Self);
+end;
+
+procedure TzFloatPreference.SetExpPrecision(const Value: Integer);
+begin
+  if Value <> FExpPrecision then
+  begin
+    FExpPrecision := Value;
+    Changed;
+  end;
+end;
+
+procedure TzFloatPreference.SetMaxDigits(const Value: Integer);
+begin
+  if Value <> FMaxDigits then
+  begin
+    FMaxDigits := Value;
+    Changed;
+  end;
+end;
+
+{$IFDEF CUSTOMFLOATCONV}
+procedure TzFloatPreference.SetFormatOptions(const Value: TFloatFormatOptions);
+begin
+  if Value <> FFormatOptions then
+  begin
+    FFormatOptions := Value;
+    Changed;
+  end;
+end;
+{$ENDIF}
+
 procedure TzFloatPreference.Assign(Source: TPersistent);
 begin
   if Source is TzFloatPreference then
   begin
-    MaxDigits := TzFloatPreference(Source).MaxDigits;
-    ExpPrecision := TzFloatPreference(Source).ExpPrecision;
+    { The fields, then one change notification. }
+    FMaxDigits := TzFloatPreference(Source).MaxDigits;
+    FExpPrecision := TzFloatPreference(Source).ExpPrecision;
 {$IFDEF CUSTOMFLOATCONV}
-    FormatOptions := TzFloatPreference(Source).FormatOptions;
+    FFormatOptions := TzFloatPreference(Source).FormatOptions;
 {$ENDIF}
+    Changed;
   end
   else
     inherited Assign(Source);
