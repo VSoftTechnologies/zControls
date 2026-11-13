@@ -4331,7 +4331,11 @@ begin
     vkDown:
       begin
         Inc(Index);
-        Index := min(FInspector.VisiblePropCount - 1, Index);
+        { Clamp to whichever list is being navigated. }
+        if ToList then
+          Index := min(FList.Items.Count - 1, Index)
+        else
+          Index := min(FInspector.VisiblePropCount - 1, Index);
       end;
   else
     begin
