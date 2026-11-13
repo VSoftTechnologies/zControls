@@ -2161,28 +2161,30 @@ var
   R: TRect;
 begin
   CanvasStack.Push(Canvas);
-  if FHeaderPropPressed then
-    LDetails := StyleServices.GetElementDetails(thHeaderItemPressed)
-  else
-    LDetails := StyleServices.GetElementDetails(thHeaderItemNormal);;
+  try
+    if FHeaderPropPressed then
+      LDetails := StyleServices.GetElementDetails(thHeaderItemPressed)
+    else
+      LDetails := StyleServices.GetElementDetails(thHeaderItemNormal);;
 
-  StyleServices.DrawElement(Canvas.Handle, LDetails, HeaderPropRect);
-  R := HeaderPropRect;
-  Inc(R.Left, 10);
-  // StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderPropText, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER, 0);
-  StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderPropText, R, [tfLeft, tfSingleLine, tfVerticalCenter]);
-  if FHeaderValuePressed then
-    LDetails := StyleServices.GetElementDetails(thHeaderItemPressed)
-  else
-    LDetails := StyleServices.GetElementDetails(thHeaderItemNormal);;
+    StyleServices.DrawElement(Canvas.Handle, LDetails, HeaderPropRect);
+    R := HeaderPropRect;
+    Inc(R.Left, 10);
+    // StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderPropText, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER, 0);
+    StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderPropText, R, [tfLeft, tfSingleLine, tfVerticalCenter]);
+    if FHeaderValuePressed then
+      LDetails := StyleServices.GetElementDetails(thHeaderItemPressed)
+    else
+      LDetails := StyleServices.GetElementDetails(thHeaderItemNormal);;
 
-  StyleServices.DrawElement(Canvas.Handle, LDetails, HeaderValueRect);
-  R := HeaderValueRect;
-  Inc(R.Left, 10);
-  // StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderValueText, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER, 0);
-  StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderValueText, R, [tfLeft, tfSingleLine, tfVerticalCenter]);
-
-  CanvasStack.Pop;
+    StyleServices.DrawElement(Canvas.Handle, LDetails, HeaderValueRect);
+    R := HeaderValueRect;
+    Inc(R.Left, 10);
+    // StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderValueText, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER, 0);
+    StyleServices.DrawText(Canvas.Handle, LDetails, FHeaderValueText, R, [tfLeft, tfSingleLine, tfVerticalCenter]);
+  finally
+    CanvasStack.Pop;
+  end;
 end;
 
 procedure TzObjInspectorHeader.SetHeaderPropText(const Value: String);
@@ -2375,9 +2377,14 @@ begin
 
   for i := FirstItem to LastItem do
   begin
+    { try/finally keeps the canvas stack balanced when painting a row raises, eg a
+      property getter that raises; an unbalanced stack is left for the next Invalidate. }
     CanvasStack.Push(Canvas);
-    PaintItem(i);
-    CanvasStack.Pop;
+    try
+      PaintItem(i);
+    finally
+      CanvasStack.Pop;
+    end;
   end;
   inherited;
 end;
@@ -3218,30 +3225,31 @@ var
   LColor, LTxtColor: TColor;
 begin
   CanvasStack.Push(Canvas);
-
-  LDetails := StyleServices.GetElementDetails(tcbCategoryNormal);
-  PItem := FVisibleItems[Index];
-  R := ItemRect[Index];
-  Inc(R.Left, FGutterWidth + 1);
-  LColor := FCategoryColor;
-  if UseStyleColor then
-    LColor := StyleServices.GetStyleColor(scCategoryButtons);
-  Canvas.Brush.Color := LColor;
-  Canvas.FillRect(R);
-  LTxtColor := FCategoryTextColor;
-  if UseStyleColor then
-  begin
-    if StyleServices.GetElementColor(LDetails, ecTextColor, LColor) then
-      if LColor <> clNone then
-        LTxtColor := LColor;
+  try
+    LDetails := StyleServices.GetElementDetails(tcbCategoryNormal);
+    PItem := FVisibleItems[Index];
+    R := ItemRect[Index];
+    Inc(R.Left, FGutterWidth + 1);
+    LColor := FCategoryColor;
+    if UseStyleColor then
+      LColor := StyleServices.GetStyleColor(scCategoryButtons);
+    Canvas.Brush.Color := LColor;
+    Canvas.FillRect(R);
+    LTxtColor := FCategoryTextColor;
+    if UseStyleColor then
+    begin
+      if StyleServices.GetElementColor(LDetails, ecTextColor, LColor) then
+        if LColor <> clNone then
+          LTxtColor := LColor;
+    end;
+    Canvas.Font.Color := LTxtColor;
+    Canvas.Font.Style := Canvas.Font.Style + [fsBold];
+    Inc(R.Left, FSepTxtDis);
+    DrawText(Canvas.Handle, PItem^.Name, -1, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER);
+    Canvas.Font.Style := Canvas.Font.Style - [fsBold];
+  finally
+    CanvasStack.Pop;
   end;
-  Canvas.Font.Color := LTxtColor;
-  Canvas.Font.Style := Canvas.Font.Style + [fsBold];
-  Inc(R.Left, FSepTxtDis);
-  DrawText(Canvas.Handle, PItem^.Name, -1, R, DT_LEFT or DT_SINGLELINE or DT_VCENTER);
-  Canvas.Font.Style := Canvas.Font.Style - [fsBold];
-
-  CanvasStack.Pop;
 end;
 
 procedure TzCustomObjInspector.PaintItem(Index: Integer);
@@ -3446,9 +3454,12 @@ var
   R: TRect;
 begin
   CanvasStack.Push(Canvas);
-  R := ValueRect[Index];
-  DefaultValueManager.PaintValue(Canvas, Index, PItem, R{$IF CompilerVersion >= 33}, FCurrentPPI{$IFEND});
-  CanvasStack.Pop;
+  try
+    R := ValueRect[Index];
+    DefaultValueManager.PaintValue(Canvas, Index, PItem, R{$IF CompilerVersion >= 33}, FCurrentPPI{$IFEND});
+  finally
+    CanvasStack.Pop;
+  end;
 end;
 
 procedure TzCustomObjInspector.SelectItem(Index: Integer);
@@ -4930,32 +4941,33 @@ begin
   BoolVal := False;
 
   LInspector.CanvasStack.Push(Canvas);
-
-  if (VT = vtBool) or (VT = vtSetElement) then
-  begin
-    case VT of
-      vtBool:
-        BoolVal := GetValueAs<Boolean>(Value);
-      vtSetElement:
-        BoolVal := SetEnumToBoolean(GetEnumOrdValue(Value), PItem.SetElementValue);
+  try
+    if (VT = vtBool) or (VT = vtSetElement) then
+    begin
+      case VT of
+        vtBool:
+          BoolVal := GetValueAs<Boolean>(Value);
+        vtSetElement:
+          BoolVal := SetEnumToBoolean(GetEnumOrdValue(Value), PItem.SetElementValue);
+      end;
+      if BoolVal then
+        LDetails := LStyle.GetElementDetails(tbCheckBoxCheckedNormal)
+      else
+        LDetails := LStyle.GetElementDetails(tbCheckBoxUnCheckedNormal);
+      ExtRect := LInspector.ExtraRect[Index];
+      LStyle.DrawElement(DC, LDetails, ExtRect{$IF CompilerVersion >= 33},nil, PPI{$IFEND});
+    end
+    else if VT = vtColor then
+    begin
+      C := GetValueAs<TColor>(Value);
+      ExtRect := LInspector.ExtraRect[Index]; { Delphi Berlin color style }
+      if LInspector.FSelectedIndex = Index then
+        InflateRect(ExtRect, -1, -1);
+      zFillRect(DC, ExtRect, ColorToRGB(C), clBlack, 1, 1);
     end;
-    if BoolVal then
-      LDetails := LStyle.GetElementDetails(tbCheckBoxCheckedNormal)
-    else
-      LDetails := LStyle.GetElementDetails(tbCheckBoxUnCheckedNormal);
-    ExtRect := LInspector.ExtraRect[Index];
-    LStyle.DrawElement(DC, LDetails, ExtRect{$IF CompilerVersion >= 33},nil, PPI{$IFEND});
-  end
-  else if VT = vtColor then
-  begin
-    C := GetValueAs<TColor>(Value);
-    ExtRect := LInspector.ExtraRect[Index]; { Delphi Berlin color style }
-    if LInspector.FSelectedIndex = Index then
-      InflateRect(ExtRect, -1, -1);
-    zFillRect(DC, ExtRect, ColorToRGB(C), clBlack, 1, 1);
+  finally
+    LInspector.CanvasStack.Pop;
   end;
-
-  LInspector.CanvasStack.Pop;
 
   LQName := PItem^.FQName;
   ValueName := PItem^.ValueName;

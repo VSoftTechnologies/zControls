@@ -222,7 +222,9 @@ begin
     raise EListError.CreateRes(@SUnbalancedOperation);
   if (Index > -1) and (Index < Count) then
   begin
-    Result := Items[Index];
+    { Not Items[Index]: that is this class's own property, read by this method, so it
+      recursed until the stack overflowed. List is TStack<T>'s array, bottom first. }
+    Result := List[Index];
     Exit;
   end;
   raise EArgumentOutOfRangeException.CreateRes(@SArgumentOutOfRange);
