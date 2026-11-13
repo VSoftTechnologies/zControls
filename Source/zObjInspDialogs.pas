@@ -25,26 +25,15 @@ unit zObjInspDialogs;
 
 interface
 
-uses Vcl.Forms, zObjInspector;
+uses zObjInspector;
 
 type
-  TzInspDialog = class(TForm)
-  private
-    FPropItem: PPropItem;
-  protected
-    procedure DoCreate; override;
-  public
-    property PropItem: PPropItem read FPropItem write FPropItem;
-  end;
+  { The dialog base class is declared in zObjInspector. This unit used to declare a
+    second, unrelated TzInspDialog, and dialogs derived from it failed the
+    InheritsFrom check in ShowModalDialog with DialogDerivedError. Kept as an alias
+    so that code using this unit still compiles. }
+  TzInspDialog = zObjInspector.TzInspDialog;
 
 implementation
-
-{ TzInspDialog }
-
-procedure TzInspDialog.DoCreate;
-begin
-  inherited;
-  FPropItem := nil;
-end;
 
 end.

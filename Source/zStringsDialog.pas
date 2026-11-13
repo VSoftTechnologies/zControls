@@ -79,7 +79,8 @@ end;
 procedure TStringsDialog.InitDialog;
 begin
   FItems := TStrings(PropItem.Value.AsObject);
-  FSaveItems := TStringList.Create;
+  if not Assigned(FSaveItems) then // InitDialog runs each time PropItem is set
+    FSaveItems := TStringList.Create;
   FSaveItems.Assign(FItems);
   pMemo.Lines.Assign(FItems);
 end;

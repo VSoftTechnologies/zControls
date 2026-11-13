@@ -56,18 +56,20 @@ end;
 
 function VKeyToStr(vKey: Word): String;
 var
-  KeyboardState: TKeyboardState;
-  P: PChar;
+  keyboardState: TKeyboardState;
+  buffer: array [0 .. 7] of WideChar;
+  count: Integer;
 begin
-  Result := '';
-  if GetKeyboardState(KeyboardState) then
+  result := '';
+  if GetKeyboardState(keyboardState) then
   begin
-    GetMem(P, 4);
-    ZeroMemory(P, 4);
-    SetLength(Result, 2);
-    if ToAscii(vKey, MapVirtualKey(vKey, 0), KeyboardState, P, 0) > 0 then
-      Result := StrPas(P);
-    FreeMem(P, 4);
+    { ToUnicode, not ToAscii: ToAscii writes ANSI bytes, which were read back as
+      WideChars, so non-Latin-1 keyboard layouts gave the wrong characters. Flag 4
+      (Windows 10 1607 and later) leaves the keyboard state alone, so a pending dead
+      key is not used up by this lookup. }
+    count := ToUnicode(vKey, MapVirtualKey(vKey, 0), keyboardState, buffer, Length(buffer), 4);
+    if count > 0 then
+      SetString(result, PChar(@buffer[0]), count);
   end;
 end;
 

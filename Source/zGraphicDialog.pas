@@ -100,6 +100,7 @@ begin
     FFilter := 'Icons|*.ico'
   else
     FFilter := '';
+  FreeAndNil(FUserGraphic); // InitDialog runs each time PropItem is set
   FUserGraphic := TGraphicClass(FGraphic.ClassType).Create;
 
   FUserGraphic.Assign(FGraphic);

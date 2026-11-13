@@ -43,6 +43,8 @@ const
 begin
   Str := S.Trim.ToLower;
   Sign := 1.0;
+  if Str = '' then // Str[1] below used to read past the end of an empty string
+    Exit(False);
 
   if Str[1] = '-' then
   begin
@@ -85,6 +87,8 @@ const
 begin
   Str := Str.Trim.ToLower;
   Sign := 1.0;
+  if Str = '' then // Str[1] below used to read past the end of an empty string
+    Exit(StrToFloat(Str)); // raises EConvertError, as for any other invalid text
 
   if Str[1] = '-' then
   begin

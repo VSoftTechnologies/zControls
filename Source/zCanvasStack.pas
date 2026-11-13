@@ -70,13 +70,20 @@ begin
 end;
 
 constructor TzCanvasStack.Create(const Collection: TEnumerable<TCanvas>);
+var
+  canvas: TCanvas;
 begin
-  FObjectsStack := TStackEx<TObject>.Create();
-  inherited Create(Collection);
+  { Push each canvas so its brush, font and pen are saved too. This used to call the
+    inherited constructor, which pushed the canvases only and left the two stacks
+    out of step. }
+  Create;
+  for canvas in Collection do
+    Push(canvas);
 end;
 
 destructor TzCanvasStack.Destroy;
 begin
+  Clear; // frees any brush, font and pen still saved on the stack
   FObjectsStack.Free;
   inherited;
 end;

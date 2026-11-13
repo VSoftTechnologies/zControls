@@ -493,6 +493,9 @@ type
     procedure InvalidateNC;
     procedure DrawSplitter(Canvas: TCanvas); virtual;
     procedure SplitterPosChanged(var Pos: Integer); virtual;
+    /// <summary> Called when SplitterPos is set from code (not while loading).
+    /// </summary>
+    procedure SplitterMoved; virtual;
     procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Integer); override;
     procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Integer); override;
     procedure Paint; override;
@@ -661,6 +664,7 @@ type
     procedure DoExtraRectClick;
     procedure UpdateEditControl(const SetValue: Boolean = True);
     procedure SplitterPosChanged(var Pos: Integer); override;
+    procedure SplitterMoved; override;
     procedure PaintItem(Index: Integer); override;
     procedure PaintCategory(Index: Integer); virtual;
     procedure PaintItemValue(PItem: PPropItem; Index: Integer); virtual;
@@ -894,7 +898,7 @@ begin
       if not Result then
         Exit;
       { Check if had same ReturnType if its a function }
-      Result := LPType.ReturnType.Handle = AMethod.Handle;
+      Result := LPType.ReturnType.Handle = AMethod.ReturnType.Handle; // was AMethod.Handle, never equal
       if not Result then
         Exit;
     end;
@@ -1077,7 +1081,8 @@ end;
 
 class function TPropItem.Empty: TPropItem;
 begin
-  ZeroMemory(@Result, SizeOf(TPropItem));
+  { Not ZeroMemory: the record holds a string, whose reference must be released. }
+  Result := Default(TPropItem);
 end;
 
 function TPropItem.EqualTo(A: PPropItem): Boolean;
@@ -1398,25 +1403,23 @@ end;
 
 function TzObjInspectorBase.GetItemOrder(PItem: PPropItem): Integer;
 var
-  i: Integer;
-  s: string;
+  P: PPropItem;
 begin
-  { Return the Item order . }
+  { The item's indentation level: its depth below the top-level item, plus one when
+    the top-level item sits in a category. This used to count the dots in the
+    qualified name, which also contains Object.ToString and category names, so a
+    ToString or category name with a '.' in it shifted the whole tree. }
   Result := 0;
-  s := PItem^.FQName;
-  i := Pos('.', s);
-  if i <= 0 then
+  if PItem^.IsCategory then
     Exit;
-  while i > 0 do
+  P := PItem;
+  while Assigned(P^.Parent) do
   begin
     Inc(Result);
-    i := Pos('.', s, i + 1);
+    P := P^.Parent;
   end;
-  Dec(Result);
-  // if FSortByCategory then
-  // Dec(Result);
-  // if FSortByCategory and (PItem^.CategoryIndex <= -1) then
-  // Result := 0;
+  if P^.CategoryIndex > -1 then
+    Inc(Result);
 end;
 
 procedure TzObjInspectorBase.Invalidate;
@@ -1571,6 +1574,9 @@ var
   LComponent: TObject;
   LComponentName: String;
   LMultiInstance: Boolean;
+  { SortByCategory, or a TzObjectHost, which always groups by object. A local so that
+    inspecting a host no longer switches SortByCategory on for good. }
+  categorised: Boolean;
 
   function IsCircularLink(P: Pointer; QType: String): Boolean;
   var
@@ -1677,7 +1683,8 @@ var
         PSet^.Insp := Self;
         PSet^.Parent := PItem;
         PSet^.SetElementValue := i;
-        PSet^.FQName := LQName + '.' + IntToStr(i);
+        { Zero-padded: the items are sorted by name, so element 10 used to come before 2. }
+        PSet^.FQName := LQName + '.' + Format('%.3d', [i]);
       end;
     end;
 
@@ -1707,7 +1714,7 @@ var
         end
         else
         begin
-          if FSortByCategory and (AInstance = LComponent) then
+          if categorised and (AInstance = LComponent) then
           begin
             if FPropsCategory.ContainsKey(LProp.Name) then
             begin
@@ -1741,7 +1748,7 @@ var
         PItem^.Parent := AParent;
         PItem^.Prop := LProp;
         PItem^.FQName := LQName;
-        if FSortByCategory then
+        if categorised then
           PItem^.FVisible := False
         else
           PItem^.FVisible := AParent = nil;
@@ -1789,28 +1796,33 @@ begin
   if not Assigned(FComponent) then
     Exit;
   WatchComponent(FComponent);
+  categorised := FSortByCategory;
+  { try/finally: a property getter that raises used to leak LCategory. }
   LCategory := TList<String>.Create;
-  LMultiInstance := False;
-  LComponent := FComponent;
-  if FComponent is TzObjectHost then
-  begin
-    LObjHost := TzObjectHost(FComponent);
-    FSortByCategory := True;
-    LMultiInstance := True;
-    FCategory.Clear;
-    FPropsCategory.Clear;
-    for i := 0 to LObjHost.FList.Count - 1 do
+  try
+    LMultiInstance := False;
+    LComponent := FComponent;
+    if FComponent is TzObjectHost then
     begin
-      LComponent := LObjHost.FList[i].Key;
-      LComponentName := LObjHost.FList[i].Value;
-      WatchComponent(LComponent);
-      EnumProps(LComponent, nil, nil, LComponentName + '.' + LComponent.ToString, LComponent.ToString);
-    end;
-  end
-  else
-    EnumProps(FComponent, nil, nil, FComponent.ToString, FComponent.ToString);
-  FItems.Sort;
-  LCategory.Free;
+      LObjHost := TzObjectHost(FComponent);
+      categorised := True;
+      LMultiInstance := True;
+      FCategory.Clear;
+      FPropsCategory.Clear;
+      for i := 0 to LObjHost.FList.Count - 1 do
+      begin
+        LComponent := LObjHost.FList[i].Key;
+        LComponentName := LObjHost.FList[i].Value;
+        WatchComponent(LComponent);
+        EnumProps(LComponent, nil, nil, LComponentName + '.' + LComponent.ToString, LComponent.ToString);
+      end;
+    end
+    else
+      EnumProps(FComponent, nil, nil, FComponent.ToString, FComponent.ToString);
+    FItems.Sort;
+  finally
+    LCategory.Free;
+  end;
 end;
 
 procedure TzObjInspectorBase.UpdateProperties(const Repaint: Boolean);
@@ -1991,7 +2003,11 @@ end;
 
 procedure TzObjInspectorBase.SetFloatPreference(const Value: TzFloatPreference);
 begin
-  TzCustomValueManager.FloatPreference := Value;
+  { Copy the settings, as a TPersistent property should. This used to store the
+    caller's object in the class var: the original leaked, and the class destructor
+    freed the caller's object (a double free if the caller freed it too). }
+  if Assigned(Value) then
+    TzCustomValueManager.FloatPreference.Assign(Value);
   UpdateProperties;
 end;
 
@@ -2117,7 +2133,19 @@ end;
 
 procedure TzObjInspectorSizing.SetSplitterPos(const Value: Integer);
 begin
-  FSplitterPos := Value;
+  if FSplitterPos <> Value then
+  begin
+    FSplitterPos := Value;
+    { Setting SplitterPos from code used to neither repaint nor move the editor.
+      While loading, the stored value is just taken as it is. }
+    if not (csLoading in ComponentState) then
+      SplitterMoved;
+  end;
+end;
+
+procedure TzObjInspectorSizing.SplitterMoved;
+begin
+  Invalidate;
 end;
 
 procedure TzObjInspectorSizing.SplitterPosChanged(var Pos: Integer);
@@ -2847,7 +2875,7 @@ var
   s: string;
 begin
   Result := False;
-  if (Index > -1) and (Index < FVisibleItems.Count - 1) then
+  if (Index > -1) and (Index < FVisibleItems.Count) then // was Count - 1: never the last row
     if CanFocus then
     begin
       SelectItem(Index);
@@ -3114,6 +3142,11 @@ begin
         end;
         PItem := FItems.Items[Index];
         Index := FVisibleItems.IndexOf(PItem);
+        if Index < 0 then // the rebuilt item is no longer visible
+        begin
+          Invalidate;
+          Exit;
+        end;
         PItem := FVisibleItems.Items[Index];
       end;
     if (PItem^.HasChild) and (PlusMinBtnRect[Index].Contains(P)) and (not IsItemCircularLink(PItem)) then
@@ -3718,6 +3751,12 @@ begin
   UpdateEditControl;
 end;
 
+procedure TzCustomObjInspector.SplitterMoved;
+begin
+  inherited;
+  UpdateEditControl(False);
+end;
+
 procedure TzCustomObjInspector.UpdateEditControl(const SetValue: Boolean);
 var
   PItem: PPropItem;
@@ -4104,7 +4143,7 @@ begin
   if ReadOnly and (not(FPropItem^.IsSet or FPropItem^.IsClass)) then
     Font.Color := FInspector.FReadOnlyColor
   else
-    Font.Color := GetSysColor(clWindowText);
+    Font.Color := clWindowText; // was GetSysColor(clWindowText): not an index, so always 0 (black)
 
   InitList;
 end;
@@ -4144,6 +4183,7 @@ procedure TzPropInspEdit.ShowList;
 var
   NewHeight: Integer;
   P: TPoint;
+  workArea: TRect;
 begin
   if not Assigned(FList) then
     Exit;
@@ -4153,8 +4193,11 @@ begin
   // P := Point(Left - DefaultValueManager.GetExtraRectWidth(PropInfo), Top + Height + 2);
   P := Point(FInspector.SplitterPos, Top + Height + 2);
   P := Parent.ClientToScreen(P);
-  if (NewHeight + P.Y) >= Screen.Height then
-    NewHeight := Screen.Height - P.Y - 50;
+  { Fit the work area of the monitor the list opens on. Screen.Height is the primary
+    monitor only: on a monitor below it the height went negative. }
+  workArea := Screen.MonitorFromPoint(P).WorkareaRect;
+  if P.Y + NewHeight > workArea.Bottom then
+    NewHeight := max(workArea.Bottom - P.Y, FList.ItemHeight + 4);
   FList.Height := NewHeight;
   // FList.Width := ClientWidth + PropInspBtnWidth;
   FList.Width := FInspector.ClientWidth - FInspector.SplitterPos;
@@ -4204,7 +4247,7 @@ end;
 procedure TzPropInspEdit.UpdateButton;
 begin
   FButton.Visible := False;
-  if (not Assigned(FPropItem)) or (FInspector.FSelectedIndex < 0) or (FInspector.FSelectedIndex > FInspector.VisiblePropCount) then
+  if (not Assigned(FPropItem)) or (FInspector.FSelectedIndex < 0) or (FInspector.FSelectedIndex >= FInspector.VisiblePropCount) then
     Exit;
   if not FPropItem^.Prop.IsWritable then
     Exit;
@@ -4705,7 +4748,12 @@ begin
       end;
     vtChar:
       begin
-        TValueData(Val).FAsUByte := Byte(Value);
+        { WideChar is two bytes: writing only FAsUByte kept the old high byte, so a
+          PasswordChar of '●' (U+25CF) became 'Ï' (U+00CF). }
+        if Val.Kind = tkWChar then
+          TValueData(Val).FAsUWord := Word(Value)
+        else
+          TValueData(Val).FAsUByte := Byte(Value);
         Exit(Val);
       end;
     vtSingle:
