@@ -552,6 +552,7 @@ type
   TzCustomObjInspector = class(TzScrollObjInspectorList)
   private
     FPropInspEdit: TzPropInspEdit;
+    FEditorHadFocus: Boolean; // set by DetachEditor, used by the next UpdateEditControl
     FUnRegisterKeys: Boolean;
     FSelectedIndex: Integer;
     FSepTxtDis: Integer;
@@ -637,6 +638,7 @@ type
     procedure KeyDown(var Key: Word; Shift: TShiftState); override;
     procedure WndProc(var Message: TMessage); override;
     procedure UpdateSelIndex;
+    function FocusIsInside: Boolean;
     procedure CommitEditor; override;
     procedure DetachEditor; override;
     function DoExpandItem(PItem: PPropItem): Boolean;
@@ -3674,7 +3676,25 @@ var
   PItem: PPropItem;
   BtnWidth: Integer;
   LTxtValRect: TRect;
+  takeFocus: Boolean;
+  form: TCustomForm;
 begin
+  { Only move focus into the editor when focus is already in the inspector: a click,
+    a key pressed in the editor, or a rebuild while the editor had focus. Programmatic
+    changes (Component, UpdateProperties, the rebuild after a watched component is
+    freed) must not take focus from another control, and SetFocus raises when the
+    inspector cannot be focused (eg it is on a tab that is not shown).
+    Decide before hiding the editor below: hiding a focused editor moves focus to the form. }
+  takeFocus := FocusIsInside;
+  if FEditorHadFocus and not takeFocus then
+  begin
+    { DetachEditor hid the focused editor, which moved focus to the form. Restore it
+      unless another control has taken focus since. }
+    form := GetParentForm(Self);
+    takeFocus := Assigned(form) and form.HandleAllocated and (GetFocus = form.Handle);
+  end;
+  FEditorHadFocus := False;
+
   if Assigned(FPropInspEdit) and Assigned(FPropInspEdit.Parent) then
   begin
     FPropInspEdit.Visible := False;
@@ -3711,7 +3731,8 @@ begin
       FPropInspEdit.Height := Height - 3;
     end;
     FPropInspEdit.Visible := True;
-    FPropInspEdit.SetFocus;
+    if takeFocus and FPropInspEdit.CanFocus then
+      FPropInspEdit.SetFocus;
     FPropInspEdit.UpdateEditText;
   end;
 end;
@@ -3744,8 +3765,29 @@ begin
   end;
 end;
 
+function TzCustomObjInspector.FocusIsInside: Boolean;
+var
+  focusWnd: HWND;
+begin
+  result := False;
+  if not HandleAllocated then
+    Exit;
+  focusWnd := GetFocus;
+  if focusWnd = 0 then
+    Exit;
+  result := (focusWnd = Handle) or IsChild(Handle, focusWnd);
+  { The dropdown list is a top-level window (see TzPopupListBox.CreateWnd), not a child. }
+  if not result and Assigned(FPropInspEdit) and Assigned(FPropInspEdit.FList) and
+    FPropInspEdit.FList.HandleAllocated then
+    result := focusWnd = FPropInspEdit.FList.Handle;
+end;
+
 procedure TzCustomObjInspector.DetachEditor;
 begin
+  { Detach hides the editor, which moves focus out of a focused editor: remember it
+    so that the UpdateEditControl that follows a rebuild can put it back. }
+  if FocusIsInside then
+    FEditorHadFocus := True;
   FExtraRectIndex := -1;
   if Assigned(FPropInspEdit) then
     FPropInspEdit.Detach;
@@ -4160,6 +4202,10 @@ procedure TzPropInspEdit.UpdateEditText;
 var
   LQName: String;
 begin
+  { Nil when no row, or a category row, is selected; DoSetValue calls this for any
+    item, including from SetPropValue. }
+  if not Assigned(FPropItem) then
+    Exit;
   LQName := FPropItem.FQName;
   with FInspector do
   begin
