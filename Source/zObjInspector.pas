@@ -290,6 +290,7 @@ type
     FPropItem: PPropItem;
     FButton: TzPropInspButton;
     FList: TzPopupListBox;
+    FDialog: TComponent; // the dialog shown by ShowModalDialog, while it is open
     FTxtChanged: Boolean;
     FDefSelIndex: Integer;
     procedure WMSETFOCUS(var Msg: TWMSetFocus); message WM_SETFOCUS;
@@ -397,8 +398,12 @@ type
   protected
     procedure CreateWnd; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
+    /// <summary> Commit text typed into the editor and not yet applied. Called while
+    /// the current items are still valid, before they are freed and rebuilt.
+    /// </summary>
+    procedure CommitEditor; virtual;
     /// <summary> Drop every reference the editor holds to the current items, without
-    /// committing pending text. Called before the items are freed outside UpdateItems.
+    /// committing pending text. Called before the items are freed.
     /// </summary>
     procedure DetachEditor; virtual;
     procedure ClearItems;
@@ -423,7 +428,13 @@ type
     property Component: TObject read FComponent write SetComponent;
     // property ComponentRoot: TCustomForm read GetComponentRoot;
     property ComponentClassType: TClass read FComponentClassType;
+    /// <summary> The items are freed and rebuilt by UpdateProperties, ExpandItem,
+    /// CollapseItem, ExpandAll, CollapseAll and by changing Component. Do not keep a
+    /// PPropItem across those calls; keep its QualifiedName and look it up again.
+    /// </summary>
     property Items: TPropList read FItems;
+    /// <summary> Points into Items: see the note on Items.
+    /// </summary>
     property VisibleItems: TList<PPropItem> read FVisibleItems;
     property SortByCategory: Boolean read FSortByCategory write SetSortByCategory;
     property DefaultCategoryName: String read FDefaultCategoryName write FDefaultCategoryName;
@@ -626,6 +637,7 @@ type
     procedure KeyDown(var Key: Word; Shift: TShiftState); override;
     procedure WndProc(var Message: TMessage); override;
     procedure UpdateSelIndex;
+    procedure CommitEditor; override;
     procedure DetachEditor; override;
     function DoExpandItem(PItem: PPropItem): Boolean;
     function DoCollapseItem(PItem: PPropItem): Boolean;
@@ -1477,8 +1489,10 @@ begin
   FPropsCategory.Clear;
   FDefPropValue.Clear;
   FCircularLinkProps.Clear;
-  FItems.Clear;
+  { SetComponent has already committed any pending editor text. }
+  DetachEditor;
   FVisibleItems.Clear;
+  FItems.Clear;
   FSaveVisibleItems.Clear;
   FExpandedList.Clear;
   FComponentClassType := nil;
@@ -1494,6 +1508,8 @@ procedure TzObjInspectorBase.SetComponent(Value: TObject);
 begin
   if Value <> FComponent then
   begin
+    { Text typed for the current component belongs to it: apply it before switching. }
+    CommitEditor;
     FIsSettingComponent := True;
     try
       if Assigned(FComponent) and (FComponent is TzObjectHost) then
@@ -1728,6 +1744,14 @@ var
   end;
 
 begin
+  { The editor and FVisibleItems point into FItems. Commit pending editor text while
+    the items are still valid, then drop those pointers before the items are freed.
+    The caller re-attaches the editor afterwards (UpdateEditControl).
+    CommitEditor can rebuild the items itself (a class property value); that inner
+    rebuild completes before this one starts, so nothing here is left half done. }
+  CommitEditor;
+  DetachEditor;
+  FVisibleItems.Clear;
   FItems.Clear;
   FCircularLinkProps.Clear;
   FPropInstance.Clear;
@@ -1824,6 +1848,11 @@ begin
     Invalidate;
     RequestRebuild;
   end;
+end;
+
+procedure TzObjInspectorBase.CommitEditor;
+begin
+  { ==> Override <== }
 end;
 
 procedure TzObjInspectorBase.DetachEditor;
@@ -3035,8 +3064,9 @@ begin
         { FItems list does not contains childs ! }
         { => Must ReBuild the list ! }
         SaveItem := PItem^;
-        UpdateItems;
-        UpdateVisibleItems;
+        { UpdateProperties, not just UpdateItems: the rebuild detaches the editor and
+          UpdateEditControl re-attaches it to the (rebuilt) selected item. }
+        UpdateProperties;
         Index := FItems.IndexOfQName(SaveItem.QualifiedName);
         if Index < 0 then
           Exit;
@@ -3697,6 +3727,23 @@ begin
     Invalidate;
 end;
 
+procedure TzCustomObjInspector.CommitEditor;
+begin
+  if Assigned(FPropInspEdit) and Assigned(FPropInspEdit.FPropItem) and FPropInspEdit.FTxtChanged then
+  begin
+    try
+      FPropInspEdit.DoSetValueFromEdit;
+    except
+      { Rejected text (invalid value, or the setter raised) must not stop the rebuild
+        the caller asked for. Report it the way the VCL reports an exception raised
+        while handling a message, which is what the old commit from WM_KILLFOCUS
+        amounted to; DoSetValueFromEdit has already cleared FTxtChanged, so the text
+        is dropped and the editor shows the current value again. }
+      Application.HandleException(Self);
+    end;
+  end;
+end;
+
 procedure TzCustomObjInspector.DetachEditor;
 begin
   FExtraRectIndex := -1;
@@ -4012,6 +4059,11 @@ begin
     FList.FPropItem := nil;
     HideList;
   end;
+  { An open dialog keeps the PropItem it was initialised with; it must not see the
+    freed one. ShowModalDialog continues with FPropItem, which UpdateEditControl
+    re-attaches to the rebuilt item (or leaves nil if the item is gone). }
+  if FDialog is TzInspDialog then
+    TzInspDialog(FDialog).FPropItem := nil;
   if Visible then
     Visible := False;
 end;
@@ -4063,16 +4115,26 @@ begin
       if not (DialogClass.InheritsFrom(TCommonDialog) or DialogClass.InheritsFrom(TzInspDialog)) then
         raise DialogDerivedError.CreateRes(@SDialogDerivedErr);
       Dialog := DialogClass.Create(Self);
-      if DialogCode(FPropItem, Dialog, dcInit) and
-        DialogCode(FPropItem, Dialog, dcShow) then
-      begin
-        DialogCode(FPropItem, Dialog, dcFinished);
-        Value := DialogResultValue(FPropItem, Dialog);
-        FInspector.DoSetValue(FPropItem, Value);
+      FDialog := Dialog;
+      try
+        if DialogCode(FPropItem, Dialog, dcInit) and
+          DialogCode(FPropItem, Dialog, dcShow) then
+        begin
+          { The items can be rebuilt while the dialog is shown (eg by a timer calling
+            UpdateProperties): FPropItem is then the rebuilt item, or nil if it is gone. }
+          if Assigned(FPropItem) then
+          begin
+            DialogCode(FPropItem, Dialog, dcFinished);
+            Value := DialogResultValue(FPropItem, Dialog);
+            FInspector.DoSetValue(FPropItem, Value);
+          end;
+        end;
+      finally
+        FDialog := nil;
+        PostMessage(Handle, WM_LBUTTONUP, 0, 0);
+        DialogCode(FPropItem, Dialog, dcBeforeDestroying);
+        FreeAndNil(Dialog);
       end;
-      PostMessage(Handle, WM_LBUTTONUP, 0, 0);
-      DialogCode(FPropItem, Dialog, dcBeforeDestroying);
-      FreeAndNil(Dialog);
     end;
   end;
 end;
