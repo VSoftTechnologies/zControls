@@ -1,0 +1,42 @@
+# DPM package spec file
+metadata:
+  id: VSoft.zControls
+  version: 1.0.0
+  description: Object Inspector component for delphi
+  authors:
+    - Mahdi Safsafi
+  projectUrl: https://github.com/VSoftTechnologies/zControls
+  repositoryUrl: https://github.com/VSoftTechnologies/zControls
+  repositoryCommit: '#HASH#'
+  license: MPL-1.1
+  copyright: Mahdi Safsafi
+  tags:
+    - object
+    - inspector
+  frameworks:
+    - vcl
+  readme: README.md
+variables:
+  packageSource: ./Packages/Delphi 10_4+
+targetPlatforms:
+  - compiler from: delphi10.4
+    compiler to: delphi12.0
+    platforms:
+      - win32
+      - win64
+  - compiler: delphi13.0
+    platforms:
+      - win32
+      - win64
+      - winarm64ec
+templates:
+  - name: default
+    source:
+      - src: ./Source/**.pas
+      - src: ./Source/**.dfm
+      - src: ./Source/**.inc
+      - src: $packageSource$/**.*
+    build:
+      - project: $packageSource$/zControls_R.dproj
+    design:
+      - project: $packageSource$/zControls_D.dproj
