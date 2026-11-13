@@ -202,6 +202,11 @@ type
     /// use the exception class or message, which are local to the implementation.
     /// </summary>
     class procedure RaiseInvalidValue;
+    /// <summary> Parse text for a float property other than Single, Double and
+    /// Extended: TDateTime, TDate, TTime, Currency, Comp and distinct float types.
+    /// Each is parsed to match how TValue.ToString displays it.
+    /// </summary>
+    class function StrToFloatValue(const PItem: PPropItem; const S: string): TValue;
     class function GetValue(const PItem: PPropItem; const Value): TValue; virtual;
     class function GetValueAs<T>(const Value: TValue): T;
     class function GetValueName(const PItem: PPropItem): string; virtual;
@@ -4048,6 +4053,11 @@ begin
     vExtended := DefaultValueManager.StrToValue<Extended>(FPropItem, s);
     Value := DefaultValueManager.GetValue(FPropItem, vExtended);
   end
+  else if Value.Kind = tkFloat then
+    { TDateTime, TDate, TTime, Currency, Comp and distinct float types. They are
+      not the exact Single/Double/Extended types above, so they used to fall
+      through to the ordinal path below, which set them to 0. }
+    Value := DefaultValueManager.StrToFloatValue(FPropItem, s)
   else if IsValueSigned(Value) then
   begin
     vSInt := DefaultValueManager.StrToValue<Int64>(FPropItem, s);
@@ -5195,6 +5205,68 @@ end;
 class procedure TzCustomValueManager.RaiseInvalidValue;
 begin
   raise InvalidPropValueError.CreateRes(@SInvalidPropValueErr);
+end;
+
+class function TzCustomValueManager.StrToFloatValue(const PItem: PPropItem; const S: string): TValue;
+var
+  info: PTypeInfo;
+  text: string;
+  parsed: Boolean;
+  singleValue: Single;
+  doubleValue: Double;
+  extendedValue: Extended;
+  dateTimeValue: TDateTime;
+  currencyValue: Currency;
+  int64Value: Int64;
+  compValue: Comp;
+begin
+  { The value is built with the property's own type info, so TDate stays a TDate.
+    Each parser matches the formatting TValue.ToString uses to display the type. }
+  info := PItem.Prop.PropertyType.Handle;
+  text := Trim(S);
+  case GetTypeData(info)^.FloatType of
+    ftSingle:
+      begin
+        parsed := TryStrToFloat(text, singleValue);
+        TValue.Make(@singleValue, info, result);
+      end;
+    ftDouble:
+      begin
+        if info = TypeInfo(TDate) then
+          parsed := TryStrToDate(text, dateTimeValue)
+        else if info = TypeInfo(TTime) then
+          parsed := TryStrToTime(text, dateTimeValue)
+        else if info = TypeInfo(TDateTime) then
+          parsed := TryStrToDateTime(text, dateTimeValue)
+        else
+        begin
+          parsed := TryStrToFloat(text, doubleValue);
+          dateTimeValue := doubleValue;
+        end;
+        doubleValue := dateTimeValue;
+        TValue.Make(@doubleValue, info, result);
+      end;
+    ftExtended:
+      begin
+        parsed := TryStrToFloat(text, extendedValue);
+        TValue.Make(@extendedValue, info, result);
+      end;
+    ftComp:
+      begin
+        parsed := TryStrToInt64(text, int64Value);
+        compValue := int64Value;
+        TValue.Make(@compValue, info, result);
+      end;
+    ftCurr:
+      begin
+        parsed := TryStrToCurr(text, currencyValue);
+        TValue.Make(@currencyValue, info, result);
+      end;
+  else
+    parsed := False;
+  end;
+  if not parsed then
+    RaiseInvalidValue;
 end;
 
 class function TzCustomValueManager.ValueHasOpenProbabilities(const PItem: PPropItem): Boolean;
