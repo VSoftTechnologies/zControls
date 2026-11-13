@@ -313,7 +313,8 @@ type
     FInspector: TzCustomObjInspector;
     FPropItem: PPropItem;
     FButton: TzPropInspButton;
-    FList: TzPopupListBox;
+    FList: TzPopupListBox; // created on first use by EnsureList
+    FHasList: Boolean; // the current item has a dropdown list (set by InitList)
     FDialog: TComponent; // the dialog shown by ShowModalDialog, while it is open
     FTxtChanged: Boolean;
     FUpdatingText: Boolean; // UpdateEditText is setting Text: not an edit
@@ -337,6 +338,7 @@ type
     procedure DoSetValueFromList;
     procedure DoSetValueFromEdit;
     procedure InitList;
+    function EnsureList: Boolean;
     procedure ShowList;
     procedure HideList;
     procedure UpdateButton;
@@ -394,6 +396,19 @@ type
     FComponent: TObject;
     FContext: TRttiContext;
     FRttiType: TRttiType;
+    { RTTI caches. The TRttiType/TRttiProperty objects stay valid while FContext is alive. }
+    FUsedPropsCache: TDictionary<TRttiType, TArray<TRttiProperty>>;
+    FHasVisiblePropsCache: TDictionary<TClass, Boolean>; // depends on ObjectVisibility
+    { Row cache: while one row is painted, its value (a getter call), value name and
+      extra rect width are worked out once instead of up to nine times. Only set
+      between BeginRowCache and EndRowCache, so nothing outside painting sees it. }
+    FRowCacheItem: PPropItem;
+    FRowCacheHasValue: Boolean;
+    FRowCacheValue: TValue;
+    FRowCacheHasName: Boolean;
+    FRowCacheName: string;
+    FRowCacheHasExtraWidth: Boolean;
+    FRowCacheExtraWidth: Integer;
     FComponentClassType: TClass;
     FItems: TPropList;
     FVisibleItems: TList<PPropItem>;
@@ -435,6 +450,15 @@ type
     procedure DetachEditor; virtual;
     procedure ClearItems;
     procedure RequestRebuild;
+    /// <summary> TzRttiType.GetUsedProperties, cached per type.
+    /// </summary>
+    function UsedProperties(AType: TRttiType): TArray<TRttiProperty>;
+    /// <summary> Whether an object of this class shows any properties (so its row can
+    /// be expanded), cached per class.
+    /// </summary>
+    function ClassHasVisibleProps(AClass: TClass): Boolean;
+    procedure BeginRowCache(PItem: PPropItem);
+    procedure EndRowCache;
     procedure UpdateVisibleItems;
     procedure UpdateItems;
     procedure ComponentChanged; virtual;
@@ -685,6 +709,7 @@ type
     procedure SplitterPosChanged(var Pos: Integer); override;
     procedure SplitterMoved; override;
     procedure PaintItem(Index: Integer); override;
+    procedure PaintItemRow(Index: Integer);
     procedure PaintCategory(Index: Integer); virtual;
     procedure PaintItemValue(PItem: PPropItem; Index: Integer); virtual;
     procedure ChangeScale(M, D: Integer{$IF CompilerVersion >= 31}; isDpiChange: Boolean{$ENDIF}); override;
@@ -990,23 +1015,6 @@ begin
     Result := Prop.Visibility >= ObjectVisibility;
 end;
 
-function ObjHasAtLeastOneChild(Obj: TObject; ObjVisibility: TMemberVisibility): Boolean;
-var
-  LCtx: TRttiContext;
-  LType: TRttiType;
-  LPropList: TArray<TRttiProperty>;
-  LProp: TRttiProperty;
-begin
-  Result := False;
-  if not Assigned(Obj) then
-    Exit;
-  LCtx := TRttiContext.Create;
-  LType := LCtx.GetType(Obj.ClassInfo);
-  LPropList := TzRttiType(LType).GetUsedProperties;
-  for LProp in LPropList do
-    if IsPropVisible(LProp, Obj, ObjVisibility) then
-      Exit(True);
-end;
 
 function GetEnumOrdValue(const Value: TValue): Integer;
 var
@@ -1184,14 +1192,20 @@ begin
 end;
 
 function TPropItem.GetHasChild: Boolean;
+var
+  v: TValue;
 begin
   if IsCategory then
     Exit(True);
   if not MayHaveChild then
     Exit(False);
-  Result := not Value.IsEmpty;
+  { One read of the value (it calls the getter), and a per-class cached answer: this
+    is called for every object row on every paint, and used to create a TRttiContext
+    and run GetUsedProperties each time. }
+  v := Value;
+  Result := not v.IsEmpty;
   if Result and IsClass then
-    Result := ObjHasAtLeastOneChild(Value.AsObject, TzObjInspectorBase(Insp).ObjectVisibility);
+    Result := TzObjInspectorBase(Insp).ClassHasVisibleProps(v.AsObject.ClassType);
 end;
 
 { function TPropItem.GetDynInstance: TObject;
@@ -1303,18 +1317,37 @@ end;
 function TPropItem.GetValue: TValue;
 var
   LInstance: TObject;
+  owner: TzObjInspectorBase;
 begin
   Result := TValue.Empty;
   if IsCategory then
     Exit();
+  owner := TzObjInspectorBase(Insp);
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) and owner.FRowCacheHasValue then
+    Exit(owner.FRowCacheValue);
   LInstance := Instance;
   if Assigned(LInstance) then
     Result := Prop.GetValue(LInstance);
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) then
+  begin
+    owner.FRowCacheValue := Result;
+    owner.FRowCacheHasValue := True;
+  end;
 end;
 
 function TPropItem.GetValueName: String;
+var
+  owner: TzObjInspectorBase;
 begin
+  owner := TzObjInspectorBase(Insp);
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) and owner.FRowCacheHasName then
+    Exit(owner.FRowCacheName);
   Result := DefaultValueManager.GetValueName(@Self);
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) then
+  begin
+    owner.FRowCacheName := Result;
+    owner.FRowCacheHasName := True;
+  end;
 end;
 
 function TPropItem.GetVisible: Boolean;
@@ -1378,6 +1411,8 @@ begin
   CanvasStack := TzCanvasStack.Create();
   ControlStyle := ControlStyle - [csAcceptsControls];
   FContext := TRttiContext.Create;
+  FUsedPropsCache := TDictionary<TRttiType, TArray<TRttiProperty>>.Create;
+  FHasVisiblePropsCache := TDictionary<TClass, Boolean>.Create;
   FItems := TPropList.Create;
   FVisibleItems := TList<PPropItem>.Create;
   FExpandedList := TList<String>.Create;
@@ -1429,6 +1464,8 @@ begin
     FreeAndNil(FCircularLinkProps);
   if Assigned(FDefPropValue) then
     FreeAndNil(FDefPropValue);
+  FreeAndNil(FHasVisiblePropsCache);
+  FreeAndNil(FUsedPropsCache);
   FContext.Free;
   { A TzObjectHost assigned to Component is owned by the inspector: SetComponent
     frees it when it is replaced, and it used to leak when the inspector went first. }
@@ -1470,10 +1507,9 @@ procedure TzObjInspectorBase.Invalidate;
 begin
   if not FLockUpdate then
   begin
-    inherited;
     CanvasStack.Clear;
     CanvasStack.TrimExcess;
-    inherited Invalidate;
+    inherited Invalidate; // once: there was also a bare 'inherited' above
   end;
 end;
 
@@ -1628,7 +1664,6 @@ var
 
   function IsCircularLink(P: Pointer; QType: String): Boolean;
   var
-    LCtx: TRttiContext;
     LType: TRttiType;
     LPropList: TArray<TRttiProperty>;
     LProp: TRttiProperty;
@@ -1650,8 +1685,7 @@ var
       end;
     }
     Result := False;
-    LCtx := LCtx.Create;
-    LType := LCtx.GetType(P);
+    LType := FContext.GetType(P);
     (* n := Pos('.', QType);
       j := n;
       while n > 0 do
@@ -1670,7 +1704,7 @@ var
       circular child property. }
     if q = '' then
       Exit(False);
-    LPropList := TzRttiType(LType).GetUsedProperties;
+    LPropList := UsedProperties(LType);
     for LProp in LPropList do
       if IsPropVisible(LProp, LComponent, FObjectVisibility) then
         if (LProp.PropertyType.TypeKind = tkClass) then
@@ -1740,7 +1774,7 @@ var
     if not Assigned(AInstance) then
       Exit;
     FRttiType := FContext.GetType(AInstance.ClassInfo);
-    LPropList := TzRttiType(FRttiType).GetUsedProperties;
+    LPropList := UsedProperties(FRttiType);
     for LProp in LPropList do
       if IsPropVisible(LProp, AInstance, FObjectVisibility) then
       begin
@@ -1955,6 +1989,52 @@ begin
   { ==> Override <== }
 end;
 
+function TzObjInspectorBase.UsedProperties(AType: TRttiType): TArray<TRttiProperty>;
+begin
+  if not FUsedPropsCache.TryGetValue(AType, Result) then
+  begin
+    Result := TzRttiType(AType).GetUsedProperties;
+    FUsedPropsCache.Add(AType, Result);
+  end;
+end;
+
+procedure TzObjInspectorBase.BeginRowCache(PItem: PPropItem);
+begin
+  EndRowCache;
+  FRowCacheItem := PItem;
+end;
+
+procedure TzObjInspectorBase.EndRowCache;
+begin
+  FRowCacheItem := nil;
+  FRowCacheHasValue := False;
+  FRowCacheValue := TValue.Empty;
+  FRowCacheHasName := False;
+  FRowCacheName := '';
+  FRowCacheHasExtraWidth := False;
+end;
+
+function TzObjInspectorBase.ClassHasVisibleProps(AClass: TClass): Boolean;
+var
+  prop: TRttiProperty;
+  persistent: Boolean;
+begin
+  if FHasVisiblePropsCache.TryGetValue(AClass, Result) then
+    Exit;
+  { The same rule as IsPropVisible: published only for a TPersistent, otherwise
+    down to ObjectVisibility. }
+  persistent := AClass.InheritsFrom(TPersistent);
+  Result := False;
+  for prop in UsedProperties(FContext.GetType(AClass)) do
+    if (persistent and (prop.Visibility = mvPublished)) or
+      ((not persistent) and (prop.Visibility >= FObjectVisibility)) then
+    begin
+      Result := True;
+      Break;
+    end;
+  FHasVisiblePropsCache.Add(AClass, Result);
+end;
+
 procedure TzObjInspectorBase.ClearItems;
 begin
   FVisibleItems.Clear;
@@ -2036,7 +2116,9 @@ begin
       if FExpandedList.Contains(PItem^.QualifiedName) then
         MakeChildsVisible(PItem, True);
     end
-    else if (PItem.Count > 0) and FIsSettingComponent and Assigned(FOnAutoExpandItemOnInit) and FOnAutoExpandItemOnInit(Self, PItem) then
+    { the cheap tests first: Count scans the item list, and used to run for every row }
+    else if FIsSettingComponent and Assigned(FOnAutoExpandItemOnInit) and (PItem.Count > 0) and
+      FOnAutoExpandItemOnInit(Self, PItem) then
     begin
       MakeChildsVisible(PItem, True);
     end;
@@ -3030,10 +3112,20 @@ var
 begin
   Result := TRect.Empty;
   PItem := FVisibleItems[Index];
-  try
-    w := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
-  except
-    w := 0; // the value can't be read: no check box or colour box (MouseDown, WMLButtonUp)
+  if (FRowCacheItem = PItem) and FRowCacheHasExtraWidth then
+    w := FRowCacheExtraWidth
+  else
+  begin
+    try
+      w := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
+    except
+      w := 0; // the value can't be read: no check box or colour box (MouseDown, WMLButtonUp)
+    end;
+    if FRowCacheItem = PItem then
+    begin
+      FRowCacheExtraWidth := w;
+      FRowCacheHasExtraWidth := True;
+    end;
   end;
   if w > 0 then
   begin
@@ -3428,6 +3520,16 @@ begin
 end;
 
 procedure TzCustomObjInspector.PaintItem(Index: Integer);
+begin
+  BeginRowCache(FVisibleItems.Items[Index]);
+  try
+    PaintItemRow(Index);
+  finally
+    EndRowCache;
+  end;
+end;
+
+procedure TzCustomObjInspector.PaintItemRow(Index: Integer);
 var
   X, Y, cY: Integer;
   R, pmR: TRect;
@@ -3546,7 +3648,7 @@ begin
       PaintItemValue(PItem, Index);
       if Canvas.TextWidth(PItem^.ValueName) > ValueTextRect[Index].Width then
         FValuesNeedHint := True;
-      HorzDotLeft := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
+      HorzDotLeft := ExtraRect[Index].Width; // the row cache's width, not another GetExtraRectWidth
       if HorzDotLeft > 0 then
         HorzDotLeft := ValueTextRect[Index].Left
       else
@@ -3859,6 +3961,7 @@ var
   LTxtValRect: TRect;
   takeFocus: Boolean;
   form: TCustomForm;
+  attached: Boolean;
 begin
   { Only move focus into the editor when focus is already in the inspector: a click,
     a key pressed in the editor, or a rebuild while the editor had focus. Programmatic
@@ -3876,29 +3979,25 @@ begin
   end;
   FEditorHadFocus := False;
 
-  if Assigned(FPropInspEdit) and Assigned(FPropInspEdit.Parent) then
-  begin
-    FPropInspEdit.Visible := False;
-    FPropInspEdit.PropInfo := nil;
-  end;
-  if FSelectedIndex < 0 then
-    Exit;
-  UpdateSelIndex;
-  PItem := SelectedItem;
-
-  if Assigned(PItem) then
-  begin
-    if PItem^.IsCategory then
-    begin
-      if FPropInspEdit.Visible then
-        FPropInspEdit.Visible := False;
+  if not (Assigned(FPropInspEdit) and Assigned(FPropInspEdit.Parent)) then
+    Exit; // design time: no editor
+  { Commit text typed for the previous row. This used to happen through the
+    WM_KILLFOCUS caused by hiding the editor here, but hiding a focused editor moves
+    focus to the form and back on every selection, which was half the cost of
+    selecting a row. The editor now stays visible and moves to the new row; it is
+    hidden below only when no row gets an editor. }
+  CommitEditor;
+  FPropInspEdit.PropInfo := nil;
+  attached := False;
+  try
+    if FSelectedIndex < 0 then
       Exit;
-    end;
+    UpdateSelIndex;
+    PItem := SelectedItem;
+    if not Assigned(PItem) or PItem^.IsCategory then
+      Exit;
     try
       LTxtValRect := ValueTextRect[FSelectedIndex];
-      if SetValue and FPropInspEdit.Visible and (Assigned(FPropInspEdit.FPropItem)) then
-        FPropInspEdit.DoSetValueFromEdit;
-
       FPropInspEdit.PropInfo := PItem;
       with ValueRect[FSelectedIndex] do
       begin
@@ -3912,16 +4011,23 @@ begin
         FPropInspEdit.Width := LTxtValRect.Width - BtnWidth;
         FPropInspEdit.Height := Height - 3;
       end;
+      { The dropdown button used to be updated by the WM_WINDOWPOSCHANGED of hiding and
+        showing the editor; the editor may not move now, so update it here. }
+      FPropInspEdit.UpdateButton;
       FPropInspEdit.Visible := True;
       if takeFocus and FPropInspEdit.CanFocus then
         FPropInspEdit.SetFocus;
       FPropInspEdit.UpdateEditText;
+      attached := True;
     except
       { The selected row's value can't be read (its getter raises; the row shows the
         message). No editor for it, rather than an exception on every selection and an
         editor left half set up. }
       FPropInspEdit.Detach;
     end;
+  finally
+    if not attached and FPropInspEdit.Visible then
+      FPropInspEdit.Visible := False;
   end;
 end;
 
@@ -4070,9 +4176,9 @@ end;
 
 procedure TzPropInspEdit.ButtonClick(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
 begin
-  if Assigned(FList) then
+  if FHasList then
   begin
-    if IsWindowVisible(FList.Handle) then
+    if Assigned(FList) and IsWindowVisible(FList.Handle) then
       HideList
     else
       ShowList;
@@ -4124,6 +4230,8 @@ var
   NewValue: TValue;
 begin
   NewValue := TValue.Empty;
+  if not Assigned(FList) then
+    Exit;
   if FDefSelIndex = FList.ItemIndex then
     Exit;
   FDefSelIndex := FList.ItemIndex;
@@ -4150,7 +4258,7 @@ begin
   inherited;
   if DefaultValueManager.HasDialog(FPropItem) then
     ShowModalDialog
-  else if Assigned(FList) then
+  else if EnsureList then
   begin
     if FList.Items.Count > 0 then
     begin
@@ -4190,7 +4298,7 @@ begin
     FInspector.DoSetValue(FPropItem, Value);
     Exit;
   end
-  else if Assigned(FList) then
+  else if EnsureList then
   begin
     Index := FList.Items.IndexOf(s);
     if Index > -1 then
@@ -4286,6 +4394,7 @@ begin
     because hiding a focused edit sends WM_KILLFOCUS, which calls DoSetValueFromEdit. }
   FTxtChanged := False;
   FPropItem := nil;
+  FHasList := False;
   if Assigned(FList) then
   begin
     FList.FPropItem := nil;
@@ -4316,7 +4425,7 @@ var
   P: TPoint;
   workArea: TRect;
 begin
-  if not Assigned(FList) then
+  if not EnsureList then
     Exit;
   if FList.Items.Count = 0 then
     Exit;
@@ -4416,13 +4525,13 @@ begin
 end;
 
 procedure TzPropInspEdit.InitList;
-var
-  ListClass: TPopupListClass;
-  s: string;
-  SelIndex: Integer;
 begin
+  { Only decides whether the item has a dropdown list; EnsureList creates it when it
+    is first needed. It used to be created and filled (a window, and up to about 250
+    items) every time a row was selected, which made each selection take ~10 ms. }
   if Assigned(FList) then
     FreeAndNil(FList);
+  FHasList := False;
   if not FPropItem.Prop.IsWritable then
     Exit;
   if not DefaultValueManager.HasList(FPropItem) then
@@ -4431,6 +4540,20 @@ begin
       FButton.DropDown := False;
     Exit;
   end;
+  FHasList := True;
+  FDefSelIndex := -1;
+  FButton.DropDown := True;
+end;
+
+function TzPropInspEdit.EnsureList: Boolean;
+var
+  ListClass: TPopupListClass;
+  s: string;
+  SelIndex: Integer;
+begin
+  Result := Assigned(FList);
+  if Result or not FHasList or not Assigned(FPropItem) then
+    Exit;
   ListClass := DefaultValueManager.GetListClass(PropInfo);
   FList := ListClass.Create(Self);
   FList.FPropItem := FPropItem;
@@ -4446,7 +4569,7 @@ begin
   if SelIndex > -1 then
     FList.Selected[SelIndex] := True;
   FDefSelIndex := SelIndex;
-  FButton.DropDown := True;
+  Result := True;
 end;
 
 procedure TzPropInspEdit.ListBoxMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
@@ -4530,7 +4653,7 @@ begin
     Exit;
   { Auto complete user input text }
   FindText := Text;
-  if Assigned(FList) then
+  if EnsureList then
   begin
     for i := 0 to FList.Items.Count - 1 do
     begin
@@ -5047,7 +5170,7 @@ begin
     Result := GetMethodName(Value, PItem.RootComponent);
     Exit;
   end
-  else if PItem.Value.TypeInfo = TypeInfo(Single) then
+  else if Value.TypeInfo = TypeInfo(Single) then // Value, not PItem.Value: that calls the getter again
   begin
     with TzCustomValueManager.FloatPreference do
 {$IFDEF CUSTOMFLOATCONV}
@@ -5057,7 +5180,7 @@ begin
 {$ENDIF}
     Exit;
   end
-  else if PItem.Value.TypeInfo = TypeInfo(Double) then
+  else if Value.TypeInfo = TypeInfo(Double) then
   begin
     with TzCustomValueManager.FloatPreference do
 {$IFDEF CUSTOMFLOATCONV}
@@ -5067,7 +5190,7 @@ begin
 {$ENDIF}
     Exit;
   end
-  else if PItem.Value.TypeInfo = TypeInfo(Extended) then
+  else if Value.TypeInfo = TypeInfo(Extended) then
   begin
     with TzCustomValueManager.FloatPreference do
 {$IFDEF CUSTOMFLOATCONV}
@@ -5586,34 +5709,32 @@ end;
 { TzRttiType }
 function TzRttiType.GetUsedProperties: TArray<TRttiProperty>;
 var
-  LBasePropList { ,LDecPropList } : TArray<TRttiProperty>;
-  Prop: TRttiProperty;
-  L: Integer;
-  function Contains(PropArray: TArray<TRttiProperty>; AProp: TRttiProperty): Boolean;
-  var
-    LProp: TRttiProperty;
-  begin
-    Result := False;
-    for LProp in PropArray do
-      if LProp.Name = AProp.Name then
-        Exit(True);
-  end;
-
+  props: TList<TRttiProperty>;
+  names: TDictionary<string, Boolean>;
+  prop: TRttiProperty;
 begin
-  Result := GetDeclaredProperties;
-  LBasePropList := GetProperties;
-  // LDecPropList := GetDeclaredProperties;
-
-  for Prop in LBasePropList do
-  begin
-    if Assigned(Prop) and (not Contains( { LDecPropList } Result, Prop)) then
+  { The declared properties, then each inherited one not redeclared. A name set
+    instead of a scan of the result for every property (O(p^2), and the array grew
+    by one element at a time). Names are compared case-sensitively, as before. }
+  props := TList<TRttiProperty>.Create;
+  names := TDictionary<string, Boolean>.Create;
+  try
+    for prop in GetDeclaredProperties do
     begin
-      L := Length(Result) + 1;
-      SetLength(Result, L);
-      Result[L - 1] := Prop;
+      props.Add(prop);
+      names.AddOrSetValue(prop.Name, True);
     end;
+    for prop in GetProperties do
+      if Assigned(prop) and not names.ContainsKey(prop.Name) then
+      begin
+        props.Add(prop);
+        names.Add(prop.Name, True);
+      end;
+    Result := props.ToArray;
+  finally
+    names.Free;
+    props.Free;
   end;
-
 end;
 
 { TzObjectInspectorStyleHook }
@@ -5713,7 +5834,10 @@ end;
 procedure TzObjInspectorBase.SetObjectVisibility(const Value: TMemberVisibility);
 begin
   if Value >= mvPublic then
-    FObjectVisibility := Value
+  begin
+    FObjectVisibility := Value;
+    FHasVisiblePropsCache.Clear;
+  end
   else
     raise InspException.Create('Object Visibility must be mvPublic or mvPublished.');
 end;
