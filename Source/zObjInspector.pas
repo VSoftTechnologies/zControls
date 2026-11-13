@@ -193,6 +193,15 @@ type
     class function GetListClass(const PItem: PPropItem): TPopupListClass;
     class procedure SetValue(const PItem: PPropItem; var Value: TValue); virtual;
     class function StrToValue<T>(const PItem: PPropItem; const s: string): T;
+    /// <summary> Parse text for an ordinal property, Int64 and UInt64 included, and
+    /// check it against the property type's range.
+    /// </summary>
+    class function TryParseOrdinal(const PropType: TRttiType; const S: string;
+      out SValue: Int64; out UValue: UInt64): Boolean;
+    /// <summary> Raises InvalidPropValueError. StrToValue is generic, so it cannot
+    /// use the exception class or message, which are local to the implementation.
+    /// </summary>
+    class procedure RaiseInvalidValue;
     class function GetValue(const PItem: PPropItem; const Value): TValue; virtual;
     class function GetValueAs<T>(const Value: TValue): T;
     class function GetValueName(const PItem: PPropItem): string; virtual;
@@ -5046,7 +5055,7 @@ var
   fsR: T absolute vSingle;
   fdR: T absolute vDouble;
   feR: T absolute vExtended;
-  E: Integer;
+  parsed: Boolean;
 begin
 
   vUInt := 0;
@@ -5070,49 +5079,122 @@ begin
         Result := uR;
         Exit;
       end;
+    { The Try* results used to be ignored, so text that is not a number set the
+      property to 0. TryStrToFloat also fails for a value outside Single's range. }
     vtSingle:
       begin
 {$IFDEF CUSTOMFLOATCONV}
-        MyTryStrToFloat(s, vSingle);
+        parsed := MyTryStrToFloat(s, vSingle);
 {$ELSE}
-        TryStrToFloat(s, vSingle);
+        parsed := TryStrToFloat(s, vSingle);
 {$ENDIF}
+        if not parsed then
+          RaiseInvalidValue;
         Result := fsR;
         Exit;
       end;
     vtDouble:
       begin
 {$IFDEF CUSTOMFLOATCONV}
-        MyTryStrToFloat(s, vDouble);
+        parsed := MyTryStrToFloat(s, vDouble);
 {$ELSE}
-        TryStrToFloat(s, vDouble);
+        parsed := TryStrToFloat(s, vDouble);
 {$ENDIF}
+        if not parsed then
+          RaiseInvalidValue;
         Result := fdR;
         Exit;
       end;
     vtExtended:
       begin
 {$IFDEF CUSTOMFLOATCONV}
-        MyTryStrToFloat(s, vExtended);
+        parsed := MyTryStrToFloat(s, vExtended);
 {$ELSE}
-        TryStrToFloat(s, vExtended);
+        parsed := TryStrToFloat(s, vExtended);
 {$ENDIF}
+        if not parsed then
+          RaiseInvalidValue;
         Result := feR;
         Exit;
       end;
   end;
 
-  if PItem.Prop.PropertyType.IsOrdinal then
+  { Int64 and UInt64 are not IsOrdinal (TRttiInt64Type is not a TRttiOrdinalType),
+    so they used to skip parsing altogether and always became 0. }
+  if PItem.Prop.PropertyType.IsOrdinal or (PItem.Prop.PropertyType.TypeKind = tkInt64) then
   begin
-    TryStrToInt64(s, vSInt);
-    // TryStrToUInt64(s, vUInt);
-    Val(s, vUInt, E);
+    if not TryParseOrdinal(PItem.Prop.PropertyType, s, vSInt, vUInt) then
+      RaiseInvalidValue;
   end;
 
   if ValSign then
     Result := sR
   else
     Result := uR;
+end;
+
+class function TzCustomValueManager.TryParseOrdinal(const PropType: TRttiType; const S: string;
+  out SValue: Int64; out UValue: UInt64): Boolean;
+var
+  text: string;
+  minValue, maxValue: Int64;
+  bits: Integer;
+begin
+  { SValue and UValue get the same bits, so the caller can return either. }
+  result := False;
+  SValue := 0;
+  UValue := 0;
+  text := Trim(S);
+  bits := 0; // set for signed types that accept hex as a bit pattern
+  if PropType is TRttiInt64Type then
+  begin
+    minValue := TRttiInt64Type(PropType).MinValue;
+    maxValue := TRttiInt64Type(PropType).MaxValue;
+    if (minValue >= 0) and (maxValue < minValue) then
+    begin
+      { UInt64: its MaxValue reads as -1 through Int64 }
+      result := (not text.StartsWith('-')) and TryStrToUInt64(text, UValue);
+      SValue := Int64(UValue);
+      Exit;
+    end;
+  end
+  else if PropType is TRttiOrdinalType then
+  begin
+    minValue := TRttiOrdinalType(PropType).MinValue;
+    maxValue := TRttiOrdinalType(PropType).MaxValue;
+    case TRttiOrdinalType(PropType).OrdType of
+      otSByte:
+        bits := 8;
+      otSWord:
+        bits := 16;
+      otSLong:
+        bits := 32;
+      otULong:
+        begin
+          { MinValue and MaxValue are LongInt: Cardinal's MaxValue reads as -1 }
+          minValue := Cardinal(minValue);
+          maxValue := Cardinal(maxValue);
+        end;
+    end;
+  end
+  else
+    Exit;
+
+  if not TryStrToInt64(text, SValue) then
+    Exit;
+  { Hex is a bit pattern, as in Delphi source: $FF00000F in a TColor is clBtnFace,
+    and it is how ColorToString shows a system colour that has no name. }
+  if (bits > 0) and (SValue > maxValue) and (SValue < (Int64(1) shl bits)) and
+    (text.StartsWith('$') or text.StartsWith('0x', True)) then
+    SValue := SValue - (Int64(1) shl bits);
+  { Out of range used to reach the setter, which truncated it: 300 in a Byte stored 44. }
+  result := (SValue >= minValue) and (SValue <= maxValue);
+  UValue := UInt64(SValue);
+end;
+
+class procedure TzCustomValueManager.RaiseInvalidValue;
+begin
+  raise InvalidPropValueError.CreateRes(@SInvalidPropValueErr);
 end;
 
 class function TzCustomValueManager.ValueHasOpenProbabilities(const PItem: PPropItem): Boolean;
