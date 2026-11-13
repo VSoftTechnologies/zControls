@@ -536,6 +536,7 @@ type
     function GetMaxItemCount: Integer;
     function GetItemTop(vIndex: Integer): Integer;
     function GetIndexFromPoint(Pt: TPoint): Integer;
+    function MeasureItemHeight: Integer;
   protected
     procedure UpdateScrollBar;
     procedure Paint; override;
@@ -2277,7 +2278,7 @@ procedure TzScrollObjInspectorList.CMFONTCHANGED(var Message: TMessage);
 begin
   inherited;
   Canvas.Font.Assign(Font);
-  FItemHeight := Canvas.TextHeight('WA') + 4; // 17;
+  FItemHeight := MeasureItemHeight;
 end;
 
 procedure TzScrollObjInspectorList.CMParentFontChanged(
@@ -2287,7 +2288,31 @@ begin
   if ParentFont then
   begin
     Canvas.Font.Assign(Font);
-    FItemHeight := Canvas.TextHeight('WA') + 4;
+    FItemHeight := MeasureItemHeight;
+  end;
+end;
+
+function TzScrollObjInspectorList.MeasureItemHeight: Integer;
+var
+  dc: HDC;
+  oldFont: HGDIOBJ;
+  size: TSize;
+begin
+  { Measured on a screen DC, not Canvas: Canvas needs this control's window handle,
+    which cannot be created until the control and all its parents have a parent
+    window. Font changes arrive before that, eg setting Font before Parent, or the
+    CM_PARENTFONTCHANGED sent when parenting to a panel that is not parented yet. }
+  dc := GetDC(0);
+  try
+    oldFont := SelectObject(dc, Font.Handle);
+    try
+      GetTextExtentPoint32(dc, 'WA', 2, size);
+      result := size.cy + 4;
+    finally
+      SelectObject(dc, oldFont);
+    end;
+  finally
+    ReleaseDC(0, dc);
   end;
 end;
 
