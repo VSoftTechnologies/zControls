@@ -118,6 +118,10 @@ type
     FVisible: Boolean;
     FQName: String;
     FItems: TPropList;
+    { The child rows, in list order: set by TzObjInspectorBase.LinkChildren after the
+      items are built. Count and Items used to search the whole list for them. }
+    FChildren: TArray<PPropItem>;
+    FChildCount: Integer; // only used while LinkChildren runs
     function GetCount: Integer;
     function GetItem(const Index: Integer): PPropItem;
     function GetHasChild: Boolean;
@@ -163,6 +167,22 @@ type
     procedure FreeRecord(P: Pointer); override;
     function IndexOfQName(QName: String): Integer;
     procedure Sort;
+  end;
+
+  /// <summary> A case-sensitive set of strings, for the qualified names the inspector
+  /// records. These were TList&lt;string&gt;, whose Contains is a linear search, which made
+  /// rebuilding a large expanded tree quadratic. (THashSet is not in Delphi 10.4.)
+  /// </summary>
+  TzStringSet = class
+  private
+    FItems: TDictionary<string, Boolean>;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Add(const Value: string);
+    function Contains(const Value: string): Boolean;
+    procedure Remove(const Value: string);
+    procedure Clear;
   end;
 
   TPropItemEvent = function(Sender: TControl; PItem: PPropItem): Boolean of object;
@@ -302,13 +322,16 @@ type
   TzPropInspButton = class(TzCustomControl)
   private
     FDropDown: Boolean;
+    procedure SetDropDown(const Value: Boolean);
   protected
     procedure WMLButtonDown(var Message: TWMLButtonDown); message WM_LBUTTONDOWN;
     procedure WMLButtonUp(var Message: TWMLButtonUp); message WM_LBUTTONUP;
     procedure Paint; override;
   public
     constructor Create(AOwner: TComponent); override;
-    property DropDown: Boolean read FDropDown write FDropDown;
+    /// <summary> An arrow (a dropdown list) or "..." (a dialog).
+    /// </summary>
+    property DropDown: Boolean read FDropDown write SetDropDown;
   end;
 
   TzPopupListBox = class(TCustomListBox)
@@ -431,8 +454,8 @@ type
     FComponentClassType: TClass;
     FItems: TPropList;
     FVisibleItems: TList<PPropItem>;
-    FSaveVisibleItems: TList<String>;
-    FExpandedList: TList<String>;
+    FSaveVisibleItems: TzStringSet;
+    FExpandedList: TzStringSet;
     FPropInstance: TDictionary<String, TObject>;
     { The category names that category rows index into (TPropItem.CategoryIndex).
       Rebuilt with the items by UpdateItems; index 0 is DefaultCategoryName. }
@@ -440,7 +463,7 @@ type
     { RegisterPropertyInCategory: property name -> category name. Kept until
       ClearRegisteredCategorys, across component changes. }
     FPropsCategory: TDictionary<String, String>;
-    FCircularLinkProps: TList<String>;
+    FCircularLinkProps: TzStringSet;
     FFloatPreference: TzFloatPreference;
     FOnBeforeAddItem: TPropItemEvent;
     FOnAutoExpandItemOnInit: TPropItemEvent;
@@ -485,6 +508,10 @@ type
     procedure EndRowCache;
     procedure UpdateVisibleItems;
     procedure UpdateItems;
+    /// <summary> Fills each item's child list (TPropItem.Count and Items) from the
+    /// built and sorted items, in one pass.
+    /// </summary>
+    procedure LinkChildren;
     procedure ComponentChanged; virtual;
     procedure Changed; virtual;
   public
@@ -900,6 +927,7 @@ var
 implementation
 
 uses
+  System.RTLConsts,
   zObjInspList,
   zStringsDialog,
   zGraphicDialog;
@@ -1183,6 +1211,40 @@ begin
   SortOrgList(@Compare);
 end;
 
+{ TzStringSet }
+
+constructor TzStringSet.Create;
+begin
+  inherited Create;
+  FItems := TDictionary<string, Boolean>.Create;
+end;
+
+destructor TzStringSet.Destroy;
+begin
+  FItems.Free;
+  inherited;
+end;
+
+procedure TzStringSet.Add(const Value: string);
+begin
+  FItems.AddOrSetValue(Value, True);
+end;
+
+function TzStringSet.Contains(const Value: string): Boolean;
+begin
+  result := FItems.ContainsKey(Value);
+end;
+
+procedure TzStringSet.Remove(const Value: string);
+begin
+  FItems.Remove(Value);
+end;
+
+procedure TzStringSet.Clear;
+begin
+  FItems.Clear;
+end;
+
 { TPropItem }
 
 procedure TPropItem.CheckItemsList;
@@ -1219,47 +1281,19 @@ begin
 end;
 
 function TPropItem.GetCount: Integer;
-var
-  L: Integer;
-  i: Integer;
-  P: PPropItem;
 begin
+  { O(1): this used to find the item in the list (IndexOf) and scan the rows after
+    it, and Expanded, which paint calls for every row, did that three times. }
   CheckItemsList;
-  Result := 0;
   if not MayHaveChild then
-    Exit;
-  L := FItems.IndexOf(@Self);
-  if L > -1 then
-  begin
-    for i := L + 1 to FItems.Count - 1 do
-    begin
-      P := FItems.Items[i];
-      if IsCategory then
-      begin
-        if CategoryIndex = P^.CategoryIndex then
-          Inc(Result)
-        else if P^.CategoryIndex > -1 then
-          Break;
-      end
-      else
-      begin
-        if P^.Parent = @Self then
-          Inc(Result);
-        if Parent = P^.Parent then
-          Break;
-      end;
-    end;
-  end;
+    Exit(0);
+  result := Length(FChildren);
 end;
 
 function TPropItem.GetExpanded: Boolean;
 begin
   CheckItemsList;
-  Result := Count > 0;
-  if Result then
-    Result := Assigned(Items[0]);
-  if Result then
-    Result := Items[0].FVisible;
+  result := (Count > 0) and FChildren[0]^.FVisible;
 end;
 
 function TPropItem.GetHasChild: Boolean;
@@ -1332,44 +1366,14 @@ end;
 }
 
 function TPropItem.GetItem(const Index: Integer): PPropItem;
-var
-  L, J, CC, i: Integer;
-  LList: TList;
 begin
+  { It used to build a TList of every child on each call. }
   CheckItemsList;
-  Result := nil;
-  if not(IsCategory or IsClass or IsSet) then
-    Exit;
-  LList := TList.Create;
-  try
-    L := FItems.IndexOf(@Self);
-    J := 0;
-    if L > -1 then
-    begin
-      CC := Count; // Childs count.
-      for i := L + 1 to FItems.Count - 1 do
-      begin
-        if IsCategory then
-        begin
-          if FItems.Items[i].CategoryIndex = CategoryIndex then
-          begin
-            Inc(J);
-            LList.Add(FItems.Items[i]);
-          end;
-        end
-        else if FItems.Items[i].Parent = @Self then
-        begin
-          Inc(J);
-          LList.Add(FItems.Items[i]);
-        end;
-        if J = CC then
-          Break;
-      end;
-      Result := LList.Items[Index];
-    end;
-  finally
-    LList.Free;
-  end;
+  if not MayHaveChild then
+    Exit(nil);
+  if (Index < 0) or (Index >= Length(FChildren)) then
+    raise EListError.CreateResFmt(@SListIndexError, [Index]); // as TList did
+  result := FChildren[Index];
 end;
 
 function TPropItem.GetName: String;
@@ -1486,9 +1490,9 @@ begin
   FHasVisiblePropsCache := TDictionary<TClass, Boolean>.Create;
   FItems := TPropList.Create;
   FVisibleItems := TList<PPropItem>.Create;
-  FExpandedList := TList<String>.Create;
-  FSaveVisibleItems := TList<String>.Create;
-  FCircularLinkProps := TList<String>.Create;
+  FExpandedList := TzStringSet.Create;
+  FSaveVisibleItems := TzStringSet.Create;
+  FCircularLinkProps := TzStringSet.Create;
   FFloatPreference := TzFloatPreference.Create;
   FFloatPreference.OnChange := FloatPreferenceChanged;
   FCategory := TList<String>.Create;
@@ -2052,8 +2056,54 @@ begin
     else
       EnumProps(FComponent, nil, nil, FComponent.ToString, FComponent.ToString);
     FItems.Sort;
+    LinkChildren;
   finally
     LCategory.Free;
+  end;
+end;
+
+procedure TzObjInspectorBase.LinkChildren;
+var
+  i: Integer;
+  item, owner: PPropItem;
+  owners: TArray<PPropItem>;
+  categoryRows: TArray<PPropItem>;
+begin
+  { The children of an item are the items whose Parent it is; the children of a
+    category row are the top-level items in that category. Sorting by qualified name
+    puts them right after their parent, in the order Count/Items always returned. }
+  SetLength(categoryRows, FCategory.Count);
+  for i := 0 to FItems.Count - 1 do
+  begin
+    item := FItems.Items[i];
+    if item^.IsCategory and (item^.CategoryIndex >= 0) and (item^.CategoryIndex < Length(categoryRows)) then
+      categoryRows[item^.CategoryIndex] := item;
+  end;
+  { Count first, so that each array is allocated once. }
+  SetLength(owners, FItems.Count);
+  for i := 0 to FItems.Count - 1 do
+  begin
+    item := FItems.Items[i];
+    owner := item^.Parent;
+    if (owner = nil) and not item^.IsCategory and (item^.CategoryIndex >= 0) and
+      (item^.CategoryIndex < Length(categoryRows)) then
+      owner := categoryRows[item^.CategoryIndex];
+    owners[i] := owner;
+    if owner <> nil then
+      Inc(owner^.FChildCount);
+  end;
+  for i := 0 to FItems.Count - 1 do
+  begin
+    owner := owners[i];
+    if owner = nil then
+      Continue;
+    if owner^.FChildren = nil then
+    begin
+      SetLength(owner^.FChildren, owner^.FChildCount);
+      owner^.FChildCount := 0;
+    end;
+    owner^.FChildren[owner^.FChildCount] := FItems.Items[i];
+    Inc(owner^.FChildCount);
   end;
 end;
 
@@ -4242,18 +4292,14 @@ begin
     try
       LTxtValRect := ValueTextRect[FSelectedIndex];
       FPropInspEdit.PropInfo := PItem;
-      with ValueRect[FSelectedIndex] do
-      begin
-        if DefaultValueManager.HasButton(PItem) then
-          BtnWidth := PPIScale(PropInspBtnWidth) // 17
-        else
-          BtnWidth := 0;
-        FPropInspEdit.Left := LTxtValRect.Left;
-        FPropInspEdit.Top := LTxtValRect.Top + 3;
-
-        FPropInspEdit.Width := LTxtValRect.Width - BtnWidth;
-        FPropInspEdit.Height := Height - 3;
-      end;
+      if DefaultValueManager.HasButton(PItem) then
+        BtnWidth := PPIScale(PropInspBtnWidth) // 17
+      else
+        BtnWidth := 0;
+      { One move. Setting Left, Top, Width and Height moved the window up to four
+        times, and each move also re-laid out the dropdown button. }
+      FPropInspEdit.SetBounds(LTxtValRect.Left, LTxtValRect.Top + 3, LTxtValRect.Width - BtnWidth,
+        ValueRect[FSelectedIndex].Height - 3);
       { The dropdown button used to be updated by the WM_WINDOWPOSCHANGED of hiding and
         showing the editor; the editor may not move now, so update it here. }
       FPropInspEdit.UpdateButton;
@@ -4728,19 +4774,26 @@ begin
 end;
 
 procedure TzPropInspEdit.UpdateButton;
+var
+  show: Boolean;
 begin
-  FButton.Visible := False;
-  if (not Assigned(FPropItem)) or (FInspector.FSelectedIndex < 0) or (FInspector.FSelectedIndex >= FInspector.VisiblePropCount) then
+  { Runs whenever the editor moves (WM_WINDOWPOSCHANGED) as well as on selection. The
+    button used to be hidden, moved by four separate setters and shown again each
+    time, which together with the editor's own moves was over half the cost of
+    selecting a row. Now it is moved once, and hidden or shown only when that
+    changes. }
+  show := Assigned(FPropItem) and (FInspector.FSelectedIndex >= 0) and
+    (FInspector.FSelectedIndex < FInspector.VisiblePropCount) and FPropItem^.Prop.IsWritable and
+    DefaultValueManager.HasButton(FPropItem);
+  if not show then
+  begin
+    FButton.Visible := False;
     Exit;
-  if not FPropItem^.Prop.IsWritable then
-    Exit;
-  if not DefaultValueManager.HasButton(PropInfo) then
-    Exit;
-  FButton.Parent := Self.Parent;
-  FButton.Left := Self.Parent.ClientWidth - PPIScale(PropInspBtnWidth);
-  FButton.Top := Top - 3;
-  FButton.Height := FInspector.FItemHeight; // 17;
-  FButton.Width := PPIScale(PropInspBtnWidth);
+  end;
+  if FButton.Parent <> Parent then
+    FButton.Parent := Parent;
+  FButton.SetBounds(Parent.ClientWidth - PPIScale(PropInspBtnWidth), Top - 3, PPIScale(PropInspBtnWidth),
+    FInspector.FItemHeight);
   FButton.Visible := True;
 end;
 
@@ -5851,6 +5904,17 @@ constructor TzPropInspButton.Create(AOwner: TComponent);
 begin
   inherited;
   FDropDown := True;
+end;
+
+procedure TzPropInspButton.SetDropDown(const Value: Boolean);
+begin
+  { The button is no longer hidden and shown again for every row (which repainted
+    it), so repaint it when what it shows changes. }
+  if Value <> FDropDown then
+  begin
+    FDropDown := Value;
+    Invalidate;
+  end;
 end;
 
 procedure TzPropInspButton.Paint;

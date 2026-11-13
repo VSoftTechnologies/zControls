@@ -29,6 +29,7 @@ uses
   WinApi.Windows,
   System.SysUtils,
   System.Types,
+  System.UITypes,
   Vcl.Graphics,
   Vcl.Controls,
   Vcl.Styles,
@@ -75,14 +76,33 @@ end;
 
 procedure DrawHorzDotLine(Canvas: TCanvas; X, Y, Width: Integer);
 var
-  i: Integer;
+  first: Integer;
+  logBrush: TLogBrush;
+  pen, oldPen: HPEN;
+  dc: HDC;
 begin
-  for i := X to Width do
-    if i mod 2 = 0 then
-    begin
-      Canvas.MoveTo(i, Y);
-      Canvas.LineTo(i + 1, Y);
-    end;
+  { The pixels at even x from X to Width, in the pen colour. Each pixel used to be a
+    MoveTo and LineTo of its own, about 200 GDI calls for a row, and with ShowGridLines
+    on that doubled the time to paint. A cosmetic PS_ALTERNATE pen sets every other
+    pixel, so one line from the first even x draws the same pixels. }
+  first := X + (X and 1);
+  if first > Width then
+    Exit;
+  logBrush.lbStyle := BS_SOLID;
+  logBrush.lbColor := ColorToRGB(Canvas.Pen.Color);
+  logBrush.lbHatch := 0;
+  pen := ExtCreatePen(PS_COSMETIC or PS_ALTERNATE, 1, logBrush, 0, nil);
+  if pen = 0 then
+    Exit;
+  dc := Canvas.Handle;
+  oldPen := SelectObject(dc, pen);
+  try
+    MoveToEx(dc, first, Y, nil);
+    LineTo(dc, Width + 1, Y);
+  finally
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+  end;
 end;
 
 function WinInWin(AWin, Test: HWND): Boolean;
