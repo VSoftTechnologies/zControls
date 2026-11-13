@@ -1331,7 +1331,16 @@ end;
 
 destructor TzObjInspectorBase.Destroy;
 begin
-  { The free notification links to watched components are removed by TComponent.Destroy. }
+  { The editor goes first, while everything it points at is valid. Any text typed
+    into it is discarded: the inspected component may be part of the same teardown.
+    Detaching also moves focus out of the editor now; otherwise the RemoveFocus in
+    TWinControl.Destroy sends it WM_KILLFOCUS, which commits the text. }
+  DetachEditor;
+  inherited;
+  { Freed after inherited: TWinControl.Destroy removes focus and destroys the window
+    and the child controls, and the messages and callbacks that causes can still
+    reach this object. The free notification links to watched components are
+    removed by TComponent.Destroy. }
   FreeAndNil(FWatchedComponents);
   CanvasStack.Free;
   if Assigned(FExpandedList) then
@@ -1353,7 +1362,6 @@ begin
   if Assigned(FDefPropValue) then
     FreeAndNil(FDefPropValue);
   FContext.Free;
-  inherited;
 end;
 
 procedure TzObjInspectorBase.EndUpdate;
