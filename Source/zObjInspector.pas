@@ -77,6 +77,8 @@ const
 
   { Posted to the inspector to rebuild its items after a watched component was destroyed. }
   ZCM_REBUILDITEMS = ZCM_BASE + 1;
+  { Posted to the editor to apply the item clicked in its dropdown list. }
+  ZCM_APPLYLISTVALUE = ZCM_BASE + 2;
 
 type
   TzDialogState = (dcInit, dcBeforeDestroying, dcShow, dcFinished);
@@ -127,6 +129,7 @@ type
     function GetVisible: Boolean;
     procedure CheckItemsList;
     function GetComponentRoot: TCustomForm;
+    function GetRootComponent: TComponent;
   public
     function EqualTo(A: PPropItem): Boolean;
     function IsEmpty: Boolean;
@@ -137,7 +140,14 @@ type
     function IsSet: Boolean;
     function IsSetElement: Boolean;
     function MayHaveChild: Boolean;
+    /// <summary> RootComponent when it is a form, otherwise nil.
+    /// </summary>
     property ComponentRoot: TCustomForm read GetComponentRoot;
+    /// <summary> The component whose class declares the event handlers and owns the
+    /// components that a reference can be set to: the form, data module or other
+    /// top-level owner of the inspected component.
+    /// </summary>
+    property RootComponent: TComponent read GetRootComponent;
     property Count: Integer read GetCount;
     property Items[const index: Integer]: PPropItem read GetItem;
     property HasChild: Boolean read GetHasChild;
@@ -306,8 +316,10 @@ type
     FList: TzPopupListBox;
     FDialog: TComponent; // the dialog shown by ShowModalDialog, while it is open
     FTxtChanged: Boolean;
+    FUpdatingText: Boolean; // UpdateEditText is setting Text: not an edit
     FDefSelIndex: Integer;
     procedure CMWantSpecialKey(var Message: TCMWantSpecialKey); message CM_WANTSPECIALKEY;
+    procedure ZCMApplyListValue(var Message: TMessage); message ZCM_APPLYLISTVALUE;
     procedure CMVISIBLECHANGED(var Message: TMessage); message CM_VISIBLECHANGED;
     procedure WMKEYDOWN(var Message: TWMKEYDOWN); message WM_KEYDOWN;
     procedure WMLButtonDown(var Message: TWMLButtonDown); message WM_LBUTTONDOWN;
@@ -333,6 +345,7 @@ type
     procedure ButtonClick(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
     procedure PropInfoChanged;
     procedure Detach;
+    procedure Change; override;
   public
     constructor Create(AOwner: TComponent; Inspector: TzCustomObjInspector); reintroduce;
     { Do not publish any property ! }
@@ -657,6 +670,12 @@ type
     procedure WndProc(var Message: TMessage); override;
     procedure UpdateSelIndex;
     function FocusIsInside: Boolean;
+    /// <summary> PItem.HasChild, or False when reading the value raises.
+    /// </summary>
+    function ItemHasChild(PItem: PPropItem): Boolean;
+    /// <summary> Shows Msg in the value column of a row whose value can't be read.
+    /// </summary>
+    procedure PaintValueError(Index: Integer; const Msg: string);
     procedure CommitEditor; override;
     procedure DetachEditor; override;
     function DoExpandItem(PItem: PPropItem): Boolean;
@@ -1032,13 +1051,27 @@ begin
     Result := SFalseValue;
 end;
 
-function GetFormRoot(Comp: TObject): TCustomForm;
+function GetRootComponent(Comp: TObject): TComponent;
 begin
+  { The form of a control, as before. Otherwise the top-level owner below
+    Application, so that a TMenuItem, TTimer or TDataSet finds its form or data
+    module too: this used to stop at GetParentForm, which is nil for anything that
+    is not a TControl, so their events showed no names and their dropdowns were empty. }
   Result := nil;
   if Comp is TCustomForm then
-    Result := TCustomForm(Comp)
-  else if Comp is TControl then
+    Exit(TCustomForm(Comp));
+  if Comp is TControl then
+  begin
     Result := GetParentForm(TControl(Comp));
+    if Assigned(Result) then
+      Exit;
+  end;
+  if Comp is TComponent then
+  begin
+    Result := TComponent(Comp);
+    while Assigned(Result.Owner) and not (Result.Owner is TApplication) do
+      Result := Result.Owner;
+  end;
 end;
 
 { TPropList }
@@ -1091,8 +1124,19 @@ begin
 end;
 
 function TPropItem.GetComponentRoot: TCustomForm;
+var
+  root: TComponent;
 begin
-  Result := GetFormRoot(Component);
+  root := RootComponent;
+  if root is TCustomForm then
+    Result := TCustomForm(root)
+  else
+    Result := nil;
+end;
+
+function TPropItem.GetRootComponent: TComponent;
+begin
+  Result := zObjInspector.GetRootComponent(Component);
 end;
 
 function TPropItem.GetCount: Integer;
@@ -1448,8 +1492,12 @@ end;
 function TzObjInspectorBase.ItemNeedUpdate(PItem: PPropItem): Boolean;
   function WasModified(Item: TPropItem): Boolean;
   begin
-    with Item do
-      Result := IsClass and (FPropInstance.ContainsKey(QualifiedName)) and (FPropInstance[QualifiedName] <> Value.AsObject);
+    try
+      with Item do
+        Result := IsClass and (FPropInstance.ContainsKey(QualifiedName)) and (FPropInstance[QualifiedName] <> Value.AsObject);
+    except
+      Result := False; // a getter that raises: nothing new to show
+    end;
   end;
 
 var
@@ -1761,8 +1809,14 @@ var
           if PItem^.IsClass then
           begin
             LInstance := nil;
-            if not PItem^.Value.IsEmpty then
-              LInstance := PItem.Value.AsObject;
+            { A getter that raises just means no child rows here; the row itself shows
+              the error message (see PaintItem). It used to abort the whole rebuild. }
+            try
+              if not PItem^.Value.IsEmpty then
+                LInstance := PItem.Value.AsObject;
+            except
+              LInstance := nil;
+            end;
             WatchComponent(LInstance);
             if Assigned(LInstance) then
               if not IsCircularLink(LInstance.ClassInfo, LQType) then
@@ -2674,7 +2728,7 @@ begin
     iOrd := GetItemOrder(PItem);
     if iOrd > 0 then
       Exit(True)
-    else if (iOrd = 0) and not(PItem.HasChild) then
+    else if (iOrd = 0) and not ItemHasChild(PItem) then
       Exit(True);
   end;
 end;
@@ -2902,6 +2956,12 @@ begin
   Result := Assigned(PropItem);
   if not Result then
     Exit;
+  { The value being set (from the dropdown, a dialog, a check box or SetPropValue)
+    replaces anything typed into the editor for the same item. Otherwise the commit
+    in the rebuild that setting an object value triggers (UpdateItems ->
+    CommitEditor) would overwrite it with the typed text. }
+  if Assigned(FPropInspEdit) and (FPropInspEdit.FPropItem = PropItem) then
+    FPropInspEdit.FTxtChanged := False;
   if Assigned(FOnItemSetValue) then
     Result := FOnItemSetValue(Self, PropItem, Value);
   if Result then
@@ -2919,12 +2979,22 @@ end;
 procedure TzCustomObjInspector.ExpandAll;
 var
   i: Integer;
+  item: PPropItem;
 begin
   FExpandedList.Clear;
   FSaveVisibleItems.Clear;
   UpdateItems;
   for i := 0 to FItems.Count - 1 do
-    FItems.Items[i].FVisible := True;
+  begin
+    item := FItems.Items[i];
+    item^.FVisible := True;
+    { Recorded like an expand by hand, so that the next rebuild (any
+      UpdateProperties) keeps the tree expanded; it used to collapse again. The
+      lists were cleared above, so there are no duplicates to check for. }
+    FSaveVisibleItems.Add(item^.QualifiedName);
+    if item^.MayHaveChild then
+      FExpandedList.Add(item^.QualifiedName);
+  end;
   UpdateVisibleItems;
   UpdateScrollBar;
   UpdateEditControl(False);
@@ -2960,7 +3030,11 @@ var
 begin
   Result := TRect.Empty;
   PItem := FVisibleItems[Index];
-  w := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
+  try
+    w := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
+  except
+    w := 0; // the value can't be read: no check box or colour box (MouseDown, WMLButtonUp)
+  end;
   if w > 0 then
   begin
     R := ValueRect[Index];
@@ -3149,7 +3223,7 @@ begin
         end;
         PItem := FVisibleItems.Items[Index];
       end;
-    if (PItem^.HasChild) and (PlusMinBtnRect[Index].Contains(P)) and (not IsItemCircularLink(PItem)) then
+    if ItemHasChild(PItem) and (PlusMinBtnRect[Index].Contains(P)) and (not IsItemCircularLink(PItem)) then
     begin
       if PItem^.Count = 0 then
       begin
@@ -3263,8 +3337,17 @@ begin
     if R.Contains(P) then
     begin
       FBoldHint := False;
-      R := ValueTextRect[Index];
-      Hint := PItem.ValueName;
+      try
+        R := ValueTextRect[Index];
+        Hint := PItem.ValueName;
+      except
+        on E: Exception do
+        begin
+          { the value column shows the getter's error message (see PaintItem) }
+          R := ValueRect[Index];
+          Hint := E.Message;
+        end;
+      end;
       w := Canvas.TextWidth(Hint);
       MustShow := R.Width <= w;
     end
@@ -3272,7 +3355,11 @@ begin
     begin
       R := PropTextRect[Index];
       Hint := PItem.Name;
-      FBoldHint := IsValueNoDefault(PItem^.QualifiedName, PItem^.ValueName);
+      try
+        FBoldHint := IsValueNoDefault(PItem^.QualifiedName, PItem^.ValueName);
+      except
+        FBoldHint := False;
+      end;
       w := Canvas.TextWidth(Hint);
       MustShow := R.Width <= w;
     end;
@@ -3384,7 +3471,7 @@ begin
   Canvas.FillRect(R);
 
   pmR := PlusMinBtnRect[Index];
-  if PItem^.HasChild and (not FCircularLinkProps.Contains(PItem^.FQName)) then
+  if ItemHasChild(PItem) and (not FCircularLinkProps.Contains(PItem^.FQName)) then
   begin
     DrawPlusMinus(Canvas, pmR.Left, pmR.Top, not PItem.Expanded, pmR.Width, FCurrentPPI);
     HasPlusMinus := True;
@@ -3453,19 +3540,27 @@ begin
 
     Canvas.Brush.Color := LSaveColor;
     { ====> Paint Item Value <==== }
-    PaintItemValue(PItem, Index);
-
-    if Canvas.TextWidth(PItem^.ValueName) > ValueTextRect[Index].Width then
-      FValuesNeedHint := True;
+    { A getter that raises shows its message in the value column. It used to fail the
+      whole paint: an error dialog on every WM_PAINT, and no rows drawn after it. }
+    try
+      PaintItemValue(PItem, Index);
+      if Canvas.TextWidth(PItem^.ValueName) > ValueTextRect[Index].Width then
+        FValuesNeedHint := True;
+      HorzDotLeft := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
+      if HorzDotLeft > 0 then
+        HorzDotLeft := ValueTextRect[Index].Left
+      else
+        HorzDotLeft := FSplitterPos;
+    except
+      on E: Exception do
+      begin
+        PaintValueError(Index, E.Message);
+        HorzDotLeft := FSplitterPos;
+      end;
+    end;
 
     Canvas.Brush.Color := LSaveColor;
     Canvas.Pen.Color := FGridColor;
-
-    HorzDotLeft := DefaultValueManager.GetExtraRectWidth(PItem, FCurrentPPI);
-    if HorzDotLeft > 0 then
-      HorzDotLeft := ValueTextRect[Index].Left
-    else
-      HorzDotLeft := FSplitterPos;
 
     if (FSelectedIndex = Index) then
     begin
@@ -3799,27 +3894,34 @@ begin
         FPropInspEdit.Visible := False;
       Exit;
     end;
-    LTxtValRect := ValueTextRect[FSelectedIndex];
-    if SetValue and FPropInspEdit.Visible and (Assigned(FPropInspEdit.FPropItem)) then
-      FPropInspEdit.DoSetValueFromEdit;
+    try
+      LTxtValRect := ValueTextRect[FSelectedIndex];
+      if SetValue and FPropInspEdit.Visible and (Assigned(FPropInspEdit.FPropItem)) then
+        FPropInspEdit.DoSetValueFromEdit;
 
-    FPropInspEdit.PropInfo := PItem;
-    with ValueRect[FSelectedIndex] do
-    begin
-      if DefaultValueManager.HasButton(PItem) then
-        BtnWidth := PPIScale(PropInspBtnWidth) // 17
-      else
-        BtnWidth := 0;
-      FPropInspEdit.Left := LTxtValRect.Left;
-      FPropInspEdit.Top := LTxtValRect.Top + 3;
+      FPropInspEdit.PropInfo := PItem;
+      with ValueRect[FSelectedIndex] do
+      begin
+        if DefaultValueManager.HasButton(PItem) then
+          BtnWidth := PPIScale(PropInspBtnWidth) // 17
+        else
+          BtnWidth := 0;
+        FPropInspEdit.Left := LTxtValRect.Left;
+        FPropInspEdit.Top := LTxtValRect.Top + 3;
 
-      FPropInspEdit.Width := LTxtValRect.Width - BtnWidth;
-      FPropInspEdit.Height := Height - 3;
+        FPropInspEdit.Width := LTxtValRect.Width - BtnWidth;
+        FPropInspEdit.Height := Height - 3;
+      end;
+      FPropInspEdit.Visible := True;
+      if takeFocus and FPropInspEdit.CanFocus then
+        FPropInspEdit.SetFocus;
+      FPropInspEdit.UpdateEditText;
+    except
+      { The selected row's value can't be read (its getter raises; the row shows the
+        message). No editor for it, rather than an exception on every selection and an
+        editor left half set up. }
+      FPropInspEdit.Detach;
     end;
-    FPropInspEdit.Visible := True;
-    if takeFocus and FPropInspEdit.CanFocus then
-      FPropInspEdit.SetFocus;
-    FPropInspEdit.UpdateEditText;
   end;
 end;
 
@@ -3849,6 +3951,29 @@ begin
       Application.HandleException(Self);
     end;
   end;
+end;
+
+function TzCustomObjInspector.ItemHasChild(PItem: PPropItem): Boolean;
+begin
+  { HasChild reads the value of an object property. A getter that raises means no
+    child rows, not an exception from every paint or click on that row. }
+  try
+    Result := PItem^.HasChild;
+  except
+    Result := False;
+  end;
+end;
+
+procedure TzCustomObjInspector.PaintValueError(Index: Integer; const Msg: string);
+var
+  R: TRect;
+begin
+  { ValueRect, not ValueTextRect: that one reads the value again (for the extra rect). }
+  R := ValueRect[Index];
+  Inc(R.Left, FSepTxtDis);
+  Canvas.Font.Color := FReadOnlyColor;
+  Canvas.Font.Style := Canvas.Font.Style - [fsBold];
+  DrawText(Canvas.Handle, Msg, -1, R, DT_LEFT or DT_VCENTER or DT_SINGLELINE or DT_END_ELLIPSIS);
 end;
 
 function TzCustomObjInspector.FocusIsInside: Boolean;
@@ -4010,7 +4135,7 @@ begin
   if FPropItem.Prop.PropertyType.TypeKind = tkMethod then
   begin
     Method.Code := ObjValue;
-    Method.Data := FPropItem.ComponentRoot;
+    Method.Data := FPropItem.RootComponent;
     NewValue := DefaultValueManager.GetValue(FPropItem, Method);
   end
   else
@@ -4133,7 +4258,13 @@ begin
   else
   begin
     ReadOnly := not FPropItem^.Prop.IsWritable;
-    if (FPropItem^.IsSet) or (FPropItem^.IsClass) then
+    { A component reference (a writable property whose type is a TComponent) is set
+      by typing a name, from the dropdown, or cleared by deleting the text. Other
+      objects (Font, Lines...) are edited through their own rows or a dialog.
+      Component references used to be read-only as well, so their dropdown listed
+      the form's components but could not set one. }
+    if FPropItem^.IsSet or
+      (FPropItem^.IsClass and not IsPropTypeDerivedFromClass(FPropItem^.Prop.PropertyType, TComponent)) then
       ReadOnly := True;
   end;
   if not ReadOnly then
@@ -4272,7 +4403,12 @@ begin
   LQName := FPropItem.FQName;
   with FInspector do
   begin
-    Self.Text := FPropItem^.ValueName;
+    FUpdatingText := True;
+    try
+      Self.Text := FPropItem^.ValueName;
+    finally
+      FUpdatingText := False;
+    end;
     if not FDefPropValue.ContainsKey(LQName) then
       FDefPropValue.Add(LQName, Self.Text);
     SelectAll;
@@ -4315,7 +4451,26 @@ end;
 
 procedure TzPropInspEdit.ListBoxMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
 begin
-  DoSetValueFromList;
+  { Applied after the list has finished handling the click. Setting a component
+    reference rebuilds the items, and re-attaching the editor recreates FList, so
+    applying it here would free the list inside its own WM_LBUTTONDOWN. }
+  PostMessage(Handle, ZCM_APPLYLISTVALUE, 0, 0);
+end;
+
+procedure TzPropInspEdit.Change;
+begin
+  inherited;
+  { Any edit counts, not only typed characters. FTxtChanged used to be set only in
+    WMCHAR, so Backspace, Delete and the context menu's Cut, Paste and Delete were
+    lost when focus moved. Text set by UpdateEditText is not an edit. }
+  if not FUpdatingText then
+    FTxtChanged := True;
+end;
+
+procedure TzPropInspEdit.ZCMApplyListValue(var Message: TMessage);
+begin
+  if Assigned(FList) and Assigned(FPropItem) then
+    DoSetValueFromList;
 end;
 
 procedure TzPropInspEdit.WMWINDOWPOSCHANGED(var Message: TWMWindowPosChanged);
@@ -4664,7 +4819,7 @@ class procedure TzCustomValueManager.GetListItems(const PItem: PPropItem; Items:
 var
   Value: TValue;
   i: Integer;
-  Root: TCustomForm;
+  Root: TComponent;
   procedure GetMethodsItems;
   var
     LCtx: TRttiContext;
@@ -4686,7 +4841,7 @@ var
 
 begin
   Value := PItem.Prop.GetValue(PItem.Instance);
-  Root := PItem.ComponentRoot;
+  Root := PItem.RootComponent;
   if Value.TypeInfo = TypeInfo(TColor) then
     Exit;
   if Value.TypeInfo = TypeInfo(TCursor) then
@@ -4889,7 +5044,7 @@ begin
   end
   else if PItem.Prop.PropertyType.TypeKind = tkMethod then
   begin
-    Result := GetMethodName(Value, PItem.ComponentRoot);
+    Result := GetMethodName(Value, PItem.RootComponent);
     Exit;
   end
   else if PItem.Value.TypeInfo = TypeInfo(Single) then
