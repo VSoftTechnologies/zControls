@@ -75,6 +75,9 @@ const
   vtDouble = 15;
   vtExtended = 16;
 
+  { Posted to the inspector to rebuild its items after a watched component was destroyed. }
+  ZCM_REBUILDITEMS = ZCM_BASE + 1;
+
 type
   TzDialogState = (dcInit, dcBeforeDestroying, dcShow, dcFinished);
 
@@ -314,6 +317,7 @@ type
     procedure ListBoxMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
     procedure ButtonClick(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
     procedure PropInfoChanged;
+    procedure Detach;
   public
     constructor Create(AOwner: TComponent; Inspector: TzCustomObjInspector); reintroduce;
     { Do not publish any property ! }
@@ -353,6 +357,7 @@ type
     constructor Create; virtual;
     destructor Destroy; override;
     procedure AddObject(Obj: TObject; Name: String);
+    procedure RemoveObject(Obj: TObject);
   end;
 
   TzObjInspectorBase = class(TzCustomControl)
@@ -378,6 +383,11 @@ type
     FLockUpdate: Boolean;
     FObjectVisibility: TMemberVisibility;
     FIsSettingComponent: Boolean;
+    FWatchedComponents: TList<TComponent>;
+    FRebuildPending: Boolean;
+    procedure ZCMRebuildItems(var Message: TMessage); message ZCM_REBUILDITEMS;
+    procedure WatchComponent(Obj: TObject);
+    procedure WatchedComponentFreed(AComponent: TComponent);
     procedure SetComponent(Value: TObject);
     function GetItemOrder(PItem: PPropItem): Integer;
     procedure SetSortByCategory(const Value: Boolean);
@@ -385,6 +395,14 @@ type
     function GetFloatPreference: TzFloatPreference;
     procedure SetFloatPreference(const Value: TzFloatPreference);
   protected
+    procedure CreateWnd; override;
+    procedure Notification(AComponent: TComponent; Operation: TOperation); override;
+    /// <summary> Drop every reference the editor holds to the current items, without
+    /// committing pending text. Called before the items are freed outside UpdateItems.
+    /// </summary>
+    procedure DetachEditor; virtual;
+    procedure ClearItems;
+    procedure RequestRebuild;
     procedure UpdateVisibleItems;
     procedure UpdateItems;
     procedure ComponentChanged; virtual;
@@ -608,6 +626,7 @@ type
     procedure KeyDown(var Key: Word; Shift: TShiftState); override;
     procedure WndProc(var Message: TMessage); override;
     procedure UpdateSelIndex;
+    procedure DetachEditor; override;
     function DoExpandItem(PItem: PPropItem): Boolean;
     function DoCollapseItem(PItem: PPropItem): Boolean;
     procedure DoExtraRectClick;
@@ -1290,6 +1309,8 @@ begin
   FCategory := TList<String>.Create;
   FPropsCategory := TDictionary<String, Integer>.Create;
   FPropInstance := TDictionary<String, TObject>.Create;
+  FWatchedComponents := TList<TComponent>.Create;
+  FRebuildPending := False;
   FDefaultCategoryName := 'Miscellaneous';
   FSortByCategory := False;
   FOnBeforeAddItem := nil;
@@ -1300,6 +1321,8 @@ end;
 
 destructor TzObjInspectorBase.Destroy;
 begin
+  { The free notification links to watched components are removed by TComponent.Destroy. }
+  FreeAndNil(FWatchedComponents);
   CanvasStack.Free;
   if Assigned(FExpandedList) then
     FreeAndNil(FExpandedList);
@@ -1476,6 +1499,9 @@ begin
       if Assigned(FComponent) and (FComponent is TzObjectHost) then
         FreeAndNil(FComponent);
       FComponent := Value;
+      FRebuildPending := False;
+      FWatchedComponents.Clear;
+      WatchComponent(FComponent);
       ComponentChanged;
     finally
       FIsSettingComponent := False;
@@ -1685,6 +1711,7 @@ var
             LInstance := nil;
             if not PItem^.Value.IsEmpty then
               LInstance := PItem.Value.AsObject;
+            WatchComponent(LInstance);
             if Assigned(LInstance) then
               if not IsCircularLink(LInstance.ClassInfo, LQType) then
                 EnumProps(LInstance, PItem, PCategory, PItem.FQName, LQType)
@@ -1704,8 +1731,11 @@ begin
   FItems.Clear;
   FCircularLinkProps.Clear;
   FPropInstance.Clear;
+  { Rebuilt below: every TComponent the items will reference. }
+  FWatchedComponents.Clear;
   if not Assigned(FComponent) then
     Exit;
+  WatchComponent(FComponent);
   LCategory := TList<String>.Create;
   LMultiInstance := False;
   LComponent := FComponent;
@@ -1720,6 +1750,7 @@ begin
     begin
       LComponent := LObjHost.FList[i].Key;
       LComponentName := LObjHost.FList[i].Value;
+      WatchComponent(LComponent);
       EnumProps(LComponent, nil, nil, LComponentName + '.' + LComponent.ToString, LComponent.ToString);
     end;
   end
@@ -1732,6 +1763,107 @@ end;
 procedure TzObjInspectorBase.UpdateProperties(const Repaint: Boolean);
 begin
 
+end;
+
+procedure TzObjInspectorBase.WatchComponent(Obj: TObject);
+var
+  comp: TComponent;
+begin
+  { Only TComponent can tell us it is being destroyed. Plain TObject values cannot be
+    watched: whoever frees one must first set Component to nil (or remove it from the
+    TzObjectHost). }
+  if not (Obj is TComponent) then
+    Exit;
+  comp := TComponent(Obj);
+  if (comp = Self) or (csDestroying in ComponentState) or (csDestroying in comp.ComponentState) then
+    Exit;
+  if FWatchedComponents.IndexOf(comp) < 0 then
+  begin
+    FWatchedComponents.Add(comp);
+    { Never undone with RemoveFreeNotification: that would also break a link that
+      something else set up between the two components (eg PopupMenu). TComponent
+      removes the link when either side is destroyed, and Notification ignores
+      components that are no longer in FWatchedComponents. }
+    comp.FreeNotification(Self);
+  end;
+end;
+
+procedure TzObjInspectorBase.Notification(AComponent: TComponent; Operation: TOperation);
+begin
+  { inherited must run: TComponent.RemoveFreeNotifications loops until every
+    notified component has removed itself. }
+  inherited;
+  { A component removed from its owner without being destroyed is still valid,
+    so only react to components that are actually being destroyed. }
+  if (Operation = opRemove) and Assigned(FWatchedComponents) and
+    not (csDestroying in ComponentState) and (csDestroying in AComponent.ComponentState) and
+    (FWatchedComponents.IndexOf(AComponent) >= 0) then
+    WatchedComponentFreed(AComponent);
+end;
+
+procedure TzObjInspectorBase.WatchedComponentFreed(AComponent: TComponent);
+begin
+  { We are inside AComponent's destructor: its descendant destructors have already
+    run, and components that reference it may not have been notified yet (eg
+    Button.PopupMenu can still return the dying menu). Nothing here may read a
+    property value; the items are dropped now and rebuilt later. }
+  FWatchedComponents.Remove(AComponent);
+  DetachEditor;
+  if AComponent = FComponent then
+  begin
+    FComponent := nil;
+    FRebuildPending := False;
+    { With no component, ComponentChanged clears everything without reading any property. }
+    ComponentChanged;
+  end
+  else
+  begin
+    if FComponent is TzObjectHost then
+      TzObjectHost(FComponent).RemoveObject(AComponent);
+    ClearItems;
+    Invalidate;
+    RequestRebuild;
+  end;
+end;
+
+procedure TzObjInspectorBase.DetachEditor;
+begin
+  { ==> Override <== }
+end;
+
+procedure TzObjInspectorBase.ClearItems;
+begin
+  FVisibleItems.Clear;
+  FItems.Clear;
+  FPropInstance.Clear;
+  FCircularLinkProps.Clear;
+end;
+
+procedure TzObjInspectorBase.RequestRebuild;
+begin
+  { Posted so that the rebuild runs after the destructor that triggered it has
+    finished and every other component has been notified. Repeated requests
+    collapse into one rebuild. }
+  FRebuildPending := True;
+  if HandleAllocated then
+    PostMessage(Handle, ZCM_REBUILDITEMS, 0, 0);
+end;
+
+procedure TzObjInspectorBase.CreateWnd;
+begin
+  inherited;
+  { A message posted to a previous window handle was lost when it was destroyed. }
+  if FRebuildPending then
+    PostMessage(Handle, ZCM_REBUILDITEMS, 0, 0);
+end;
+
+procedure TzObjInspectorBase.ZCMRebuildItems(var Message: TMessage);
+begin
+  if FRebuildPending and not (csDestroying in ComponentState) then
+  begin
+    FRebuildPending := False;
+    UpdateProperties(True);
+  end;
 end;
 
 procedure TzObjInspectorBase.UpdateVisibleItems;
@@ -3565,6 +3697,13 @@ begin
     Invalidate;
 end;
 
+procedure TzCustomObjInspector.DetachEditor;
+begin
+  FExtraRectIndex := -1;
+  if Assigned(FPropInspEdit) then
+    FPropInspEdit.Detach;
+end;
+
 procedure TzCustomObjInspector.UpdateSelIndex;
 var
   P: PPropItem;
@@ -3859,6 +3998,22 @@ begin
     Font.Color := GetSysColor(clWindowText);
 
   InitList;
+end;
+
+procedure TzPropInspEdit.Detach;
+begin
+  { Discard any pending text rather than commit it: the object being edited may be
+    part-way through its destructor. Clear FTxtChanged and FPropItem before hiding,
+    because hiding a focused edit sends WM_KILLFOCUS, which calls DoSetValueFromEdit. }
+  FTxtChanged := False;
+  FPropItem := nil;
+  if Assigned(FList) then
+  begin
+    FList.FPropItem := nil;
+    HideList;
+  end;
+  if Visible then
+    Visible := False;
 end;
 
 procedure TzPropInspEdit.SetPropItem(const Value: PPropItem);
@@ -5019,6 +5174,15 @@ begin
   P.Key := Obj;
   P.Value := Name;
   FList.Add(P);
+end;
+
+procedure TzObjectHost.RemoveObject(Obj: TObject);
+var
+  i: Integer;
+begin
+  for i := FList.Count - 1 downto 0 do
+    if FList[i].Key = Obj then
+      FList.Delete(i);
 end;
 
 constructor TzObjectHost.Create;
