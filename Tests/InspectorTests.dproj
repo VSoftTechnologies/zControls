@@ -11,6 +11,13 @@
         <AppType>Console</AppType>
         <ProjectName Condition="'$(ProjectName)'==''">InspectorTests</ProjectName>
     </PropertyGroup>
+    <PropertyGroup>
+        <DPMCompiler>delphi13.0</DPMCompiler>
+        <DPMCache Condition="'$(DPMCache)' == ''">$(APPDATA)\.dpm\package_cache</DPMCache>
+        <DPM>$(DPMCache)\$(DPMCompiler)</DPM>
+        <DPMSearch Condition="'$(Platform)'=='Win32'">$(DPM)\VSoft.DUnitX\0.5.1\lib\Win32;</DPMSearch>
+        <DPMSearch Condition="'$(Platform)'=='Win64'">$(DPM)\VSoft.DUnitX\0.5.1\lib\Win64;</DPMSearch>
+    </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
     </PropertyGroup>
@@ -37,7 +44,7 @@
     <PropertyGroup Condition="'$(Base)'!=''">
         <SanitizedProjectName>InspectorTests</SanitizedProjectName>
         <DCC_Namespace>System;Xml;Data;Vcl;Vcl.Imaging;$(DCC_Namespace)</DCC_Namespace>
-        <DCC_UnitSearchPath>..\Source;..\Source\FloatConv;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+        <DCC_UnitSearchPath>$(DPMSearch);..\Source;..\Source\FloatConv;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <DCC_IncludePath>..\Source;..\Source\FloatConv;$(DCC_IncludePath)</DCC_IncludePath>
         <DCC_ResourcePath>..\Source;$(DCC_ResourcePath)</DCC_ResourcePath>
         <DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
@@ -74,6 +81,10 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="PoisonMM.pas"/>
+        <DCCReference Include="Testing.Inspector.pas"/>
+        <DCCReference Include="Tests.Crashes.pas"/>
+        <DCCReference Include="Tests.Values.pas"/>
+        <DCCReference Include="Tests.Fixes.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -101,7 +112,13 @@
             </Platforms>
         </BorlandProject>
         <ProjectFileVersion>12</ProjectFileVersion>
+        <DPM>
+            <Packages>
+                <PackageReference id="VSoft.DUnitX" version="0.5.1" manifestHash="sha256:36bfff30392fe7ead91377f6fcd59133b3f17b428da67afe5f27ced9a67f3d8a"/>
+            </Packages>
+        </DPM>
     </ProjectExtensions>
     <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
     <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
+    <Import Project="$(DPMCache)\DPM.CopyLocal.targets" Condition="Exists('$(DPMCache)\DPM.CopyLocal.targets')"/>
 </Project>
