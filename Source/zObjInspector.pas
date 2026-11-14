@@ -111,13 +111,16 @@ type
     Component: TObject;
     SetElementValue: Integer;
     Insp: TControl;
-    Instance: TObject;
     FIsCategory: Boolean;
     CategoryIndex: Integer;
   private
     FVisible: Boolean;
     FQName: String;
     FItems: TPropList;
+    { The object the row's property was read from when the items were built, and its
+      class. Read through Instance, which checks it is still current. }
+    FInstance: TObject;
+    FInstanceClass: TClass;
     { The child rows, in list order: set by TzObjInspectorBase.LinkChildren after the
       items are built. Count and Items used to search the whole list for them. }
     FChildren: TArray<PPropItem>;
@@ -125,7 +128,8 @@ type
     function GetCount: Integer;
     function GetItem(const Index: Integer): PPropItem;
     function GetHasChild: Boolean;
-    // function GetDynInstance: TObject;
+    function GetInstance: TObject;
+    procedure SetInstance(const Value: TObject);
     function GetExpanded: Boolean;
     function GetValue: TValue;
     function GetName: String;
@@ -152,6 +156,12 @@ type
     /// top-level owner of the inspected component.
     /// </summary>
     property RootComponent: TComponent read GetRootComponent;
+    /// <summary> The object this row's property belongs to. For a row under an object
+    /// property it is nil once that property no longer returns the object the row was
+    /// built from (a setter, or the program, freed it and stored another): the row has
+    /// nothing to read, and a rebuild has been posted. Nil for a category row.
+    /// </summary>
+    property Instance: TObject read GetInstance write SetInstance;
     property Count: Integer read GetCount;
     property Items[const index: Integer]: PPropItem read GetItem;
     property HasChild: Boolean read GetHasChild;
@@ -441,10 +451,13 @@ type
     { RTTI caches. The TRttiType/TRttiProperty objects stay valid while FContext is alive. }
     FUsedPropsCache: TDictionary<TRttiType, TArray<TRttiProperty>>;
     FHasVisiblePropsCache: TDictionary<TClass, Boolean>; // depends on ObjectVisibility
-    { Row cache: while one row is painted, its value (a getter call), value name and
-      extra rect width are worked out once instead of up to nine times. Only set
-      between BeginRowCache and EndRowCache, so nothing outside painting sees it. }
+    { Row cache: while one row is painted, its object (checked with getter calls),
+      value (a getter call), value name and extra rect width are worked out once
+      instead of up to nine times. Only set between BeginRowCache and EndRowCache, so
+      nothing outside painting sees it. }
     FRowCacheItem: PPropItem;
+    FRowCacheHasInstance: Boolean;
+    FRowCacheInstance: TObject;
     FRowCacheHasValue: Boolean;
     FRowCacheValue: TValue;
     FRowCacheHasName: Boolean;
@@ -477,6 +490,7 @@ type
     procedure ZCMRebuildItems(var Message: TMessage); message ZCM_REBUILDITEMS;
     procedure WatchComponent(Obj: TObject);
     procedure WatchedComponentFreed(AComponent: TComponent);
+    procedure InstanceReplaced;
     procedure SetComponent(Value: TObject);
     function GetItemOrder(PItem: PPropItem): Integer;
     procedure SetSortByCategory(const Value: Boolean);
@@ -1313,57 +1327,67 @@ begin
     Result := TzObjInspectorBase(Insp).ClassHasVisibleProps(v.AsObject.ClassType);
 end;
 
-{ function TPropItem.GetDynInstance: TObject;
-  var
-  // LInsp: TzObjInspectorBase;
-  LCtx: TRttiContext;
-  LType: TRttiType;
-  LProp: TRttiProperty;
-  LObj: TObject;
-  LValue: TValue;
-  LList: TList;
-  i: Integer;
-  procedure GetParents;
-  var
-  P: PPropItem;
-  begin
-  P := Parent;
-  while Assigned(P) do
-  begin
-  LList.Add(P);
-  P := P.Parent;
+{ The object an object property holds now, or nil when its getter raises. }
+function ReadObjectProp(Prop: TRttiProperty; Instance: TObject): TObject;
+begin
+  try
+    result := Prop.GetValue(Instance).AsObject;
+  except
+    result := nil;
   end;
-  end;
+end;
 
+procedure TPropItem.SetInstance(const Value: TObject);
+begin
+  FInstance := Value;
+  if Value <> nil then
+    FInstanceClass := Value.ClassType
+  else
+    FInstanceClass := nil;
+end;
+
+function TPropItem.GetInstance: TObject;
+var
+  owner: TzObjInspectorBase;
+  parentInstance: TObject;
+  current: TObject;
+begin
+  { A top-level row reads from the inspected object (or a hosted one), which free
+    notification or the caller looks after. A row under an object property reads from
+    the object that property held when the items were built, and nothing tells the
+    inspector when a setter, or the program, frees that object and stores another.
+    Every read from the old object was a use-after-free (paint, hints, clicks, the
+    editor's commit). So check that the property still holds it, the parent's own
+    object first, so that no getter is ever called on a freed object. }
+  result := FInstance;
+  if Parent = nil then
+    Exit;
+  owner := TzObjInspectorBase(Insp);
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) and owner.FRowCacheHasInstance then
+    Exit(owner.FRowCacheInstance);
+  parentInstance := Parent^.Instance;
+  if parentInstance = nil then
+    result := nil // the parent's object was replaced: it has posted the rebuild
+  else if Parent^.IsClass then
   begin
-  CheckItemsList;
-  // LInsp := TzObjInspectorBase(Insp);
-  LObj := Component;
-  LCtx := TRttiContext.Create;
-  LList := TList.Create;
-  GetParents;
-  Result := LObj;
-  for i := LList.Count - 1 downto 0 do
+    current := ReadObjectProp(Parent^.Prop, parentInstance);
+    { The class as well: a new object can be allocated where the freed one was. }
+    if (current = nil) or (current <> FInstance) or (current.ClassType <> FInstanceClass) then
+    begin
+      result := nil;
+      { A getter that returns a new object on every read would post a rebuild from
+        every paint, without end. Read it again: only rebuild for an object that stays. }
+      if Assigned(owner) and (ReadObjectProp(Parent^.Prop, parentInstance) = current) then
+        owner.InstanceReplaced;
+    end;
+  end;
+  { Otherwise Parent is a set row, which reads from the same object as its elements. }
+  if Assigned(owner) and (owner.FRowCacheItem = @Self) then
   begin
-  if not Assigned(LObj) then
-  begin
-  LList.Free;
-  Exit(nil);
+    owner.FRowCacheInstance := result;
+    owner.FRowCacheHasInstance := True;
   end;
-  LType := LCtx.GetType(LObj.ClassInfo);
-  LProp := LType.GetProperty(PPropItem(LList.Items[i]).Name);
-  LValue := LProp.GetValue(LObj);
-  if LValue.IsObject then
-  LObj := LValue.AsObject;
-  if LProp = Parent.Prop then
-  begin
-  Result := LObj;
-  Break;
-  end;
-  end;
-  LList.Free;
-  end;
-}
+end;
 
 function TPropItem.GetItem(const Index: Integer): PPropItem;
 begin
@@ -1417,7 +1441,10 @@ begin
   owner := TzObjInspectorBase(Insp);
   if Assigned(owner) and (owner.FRowCacheItem = @Self) and owner.FRowCacheHasName then
     Exit(owner.FRowCacheName);
-  Result := DefaultValueManager.GetValueName(@Self);
+  if (not IsCategory) and (Instance = nil) then
+    Result := '' // the row's object was replaced (see GetInstance)
+  else
+    Result := DefaultValueManager.GetValueName(@Self);
   if Assigned(owner) and (owner.FRowCacheItem = @Self) then
   begin
     owner.FRowCacheName := Result;
@@ -1429,7 +1456,7 @@ function TPropItem.GetVisible: Boolean;
 begin
   Result := FVisible;
   if Result then
-    Result := Assigned(Instance);
+    Result := Assigned(FInstance); // not Instance: that calls getters
 end;
 
 function TPropItem.IsCategory: Boolean;
@@ -1605,17 +1632,21 @@ var
   bit: Integer;
   raw: Cardinal;
   obj: TObject;
+  instance: TObject;
 begin
   { The rule TWriter uses to decide what goes into a form file (see
     System.Classes.IsDefaultPropertyValue), which is what the IDE shows in bold. This
     used to mean "changed since the row was first selected", so nothing was shown as
     non-default until it had been edited. }
   result := False;
-  if (PItem = nil) or PItem^.IsCategory or (PItem^.Instance = nil) or not (PItem^.Prop is TRttiInstanceProperty) then
+  if (PItem = nil) or PItem^.IsCategory or not (PItem^.Prop is TRttiInstanceProperty) then
     Exit;
+  instance := PItem^.Instance;
+  if instance = nil then
+    Exit; // the row's object was replaced (see TPropItem.GetInstance)
   propInfo := TRttiInstanceProperty(PItem^.Prop).PropInfo;
   try
-    if not IsStoredProp(PItem^.Instance, propInfo) then
+    if not IsStoredProp(instance, propInfo) then
       Exit;
     value := PItem^.Value;
     { Like TWriter: a read-only property is not written, unless it is a subcomponent. }
@@ -1988,12 +2019,13 @@ var
         begin
           if PItem^.IsClass then
           begin
-            LInstance := nil;
             { A getter that raises just means no child rows here; the row itself shows
               the error message (see PaintItem). It used to abort the whole rebuild. }
             try
-              if not PItem^.Value.IsEmpty then
-                LInstance := PItem.Value.AsObject;
+              { Read from AInstance directly: it was read just now, and Value would
+                check every parent again (TPropItem.GetInstance). Value was also read
+                twice here. }
+              LInstance := LProp.GetValue(AInstance).AsObject;
             except
               LInstance := nil;
             end;
@@ -2173,6 +2205,16 @@ begin
   end;
 end;
 
+procedure TzObjInspectorBase.InstanceReplaced;
+begin
+  { Found while reading a row's value, which can be inside one of the inspector's own
+    loops over the items, so they cannot be freed and rebuilt here: the rebuild is
+    posted. Until it runs, the rows of the replaced object read nil (see
+    TPropItem.GetInstance) and show no value. }
+  if not FRebuildPending then
+    RequestRebuild;
+end;
+
 procedure TzObjInspectorBase.CommitEditor;
 begin
   { ==> Override <== }
@@ -2201,6 +2243,8 @@ end;
 procedure TzObjInspectorBase.EndRowCache;
 begin
   FRowCacheItem := nil;
+  FRowCacheHasInstance := False;
+  FRowCacheInstance := nil;
   FRowCacheHasValue := False;
   FRowCacheValue := TValue.Empty;
   FRowCacheHasName := False;
@@ -3219,6 +3263,12 @@ begin
       SelectItem(Index);
       if GetFocus <> Handle then
         SetFocus;
+      { An OnSelectItem handler can rebuild the items, which moves the row, or refuse
+        the selection: the caret goes on the row that is selected now. }
+      Result := True;
+      Index := FSelectedIndex;
+      if Index < 0 then
+        Exit;
       X := PropTextRect[Index].Left;
       Y := ItemRect[Index].Top;
       s := FSearchText;
@@ -3246,6 +3296,10 @@ begin
     CommitEditor) would overwrite it with the typed text. }
   if Assigned(FPropInspEdit) and (FPropInspEdit.FPropItem = PropItem) then
     FPropInspEdit.FTxtChanged := False;
+  { The object the row belongs to was replaced (see TPropItem.GetInstance): there is
+    nothing to set the value on. The posted rebuild shows the new object. }
+  if PropItem^.Instance = nil then
+    Exit(False);
   if Assigned(FOnItemSetValue) then
     Result := FOnItemSetValue(Self, PropItem, Value);
   if Result then
@@ -3837,6 +3891,7 @@ var
   LSaveColor: TColor;
   LColor: TColor;
   HorzDotLeft: Integer;
+  instance: TObject;
 begin
 
   if Index = GetFirstItemIndex then
@@ -3917,7 +3972,8 @@ begin
       LColor := StyleServices.GetSystemColor(clBtnText);
     Canvas.Font.Color := LColor;
 
-    if (PItem.Instance is TComponent) and (PItem^.Instance <> PItem^.Component) then
+    instance := PItem^.Instance;
+    if (instance is TComponent) and (instance <> PItem^.Component) then
       Canvas.Font.Color := FSubPropertiesColor;
 
     if IsPropTypeDerivedFromClass(PItem^.Prop.PropertyType, TComponent) then
@@ -3938,14 +3994,20 @@ begin
     { A getter that raises shows its message in the value column. It used to fail the
       whole paint: an error dialog on every WM_PAINT, and no rows drawn after it. }
     try
-      PaintItemValue(PItem, Index);
-      if Canvas.TextWidth(PItem^.ValueName) > ValueTextRect[Index].Width then
-        FValuesNeedHint := True;
-      HorzDotLeft := ExtraRect[Index].Width; // the row cache's width, not another GetExtraRectWidth
-      if HorzDotLeft > 0 then
-        HorzDotLeft := ValueTextRect[Index].Left
+      { A row whose object was replaced has no value until the posted rebuild. }
+      if instance = nil then
+        HorzDotLeft := FSplitterPos
       else
-        HorzDotLeft := FSplitterPos;
+      begin
+        PaintItemValue(PItem, Index);
+        if Canvas.TextWidth(PItem^.ValueName) > ValueTextRect[Index].Width then
+          FValuesNeedHint := True;
+        HorzDotLeft := ExtraRect[Index].Width; // the row cache's width, not another GetExtraRectWidth
+        if HorzDotLeft > 0 then
+          HorzDotLeft := ValueTextRect[Index].Left
+        else
+          HorzDotLeft := FSplitterPos;
+      end;
     except
       on E: Exception do
       begin
@@ -4043,6 +4105,7 @@ end;
 procedure TzCustomObjInspector.SelectItem(Index: Integer);
 var
   LSI: TScrollInfo;
+  qName: string;
   procedure DoSetScrollInfo;
   begin
     SetScrollInfo(Handle, SB_VERT, LSI, True);
@@ -4063,8 +4126,24 @@ begin
     if (Index <> FSelectedIndex) then
     begin
       if Assigned(FOnSelectItem) then
+      begin
+        qName := FVisibleItems.Items[Index]^.QualifiedName;
         if not FOnSelectItem(Self, FVisibleItems.Items[Index]) then
           Exit;
+        { The handler can rebuild the items (UpdateProperties, ExpandItem...), which
+          moves the rows: Index was then used for whatever row had taken its place, or
+          past the end of the list. Find the row again by name. }
+        if (Index >= FVisibleItems.Count) or (FVisibleItems.Items[Index]^.QualifiedName <> qName) then
+        begin
+          Index := FItems.IndexOfQName(qName);
+          if Index >= 0 then
+            Index := FVisibleItems.IndexOf(FItems.Items[Index]);
+          if Index < 0 then
+            Exit; // gone, or no longer visible
+        end;
+        if Index = FSelectedIndex then
+          Exit; // the handler selected it itself
+      end;
       LSI.cbSize := SizeOf(FSI);
       LSI.fMask := SIF_POS;
       FSelectedIndex := Index;
@@ -4576,6 +4655,10 @@ begin
   FTxtChanged := False;
   if (ReadOnly) or (FPropItem^.IsSet) or (not FPropItem^.Prop.IsWritable) then
     Exit;
+  { The object the row belongs to was replaced (see TPropItem.GetInstance): the text
+    has nowhere to go and is dropped. It used to be written into the freed object. }
+  if FPropItem^.Instance = nil then
+    Exit;
 
   s := Text;
   if Trim(FPropItem^.ValueName) = Trim(s) then
@@ -4740,6 +4823,9 @@ var
   Value: TValue;
 begin
   DialogClass := nil;
+  { Nil Instance: the row's object was replaced (see TPropItem.GetInstance). }
+  if (FPropItem = nil) or (FPropItem^.Instance = nil) then
+    Exit;
   with DefaultValueManager do
   begin
     if HasDialog(FPropItem) then
@@ -4755,8 +4841,9 @@ begin
           DialogCode(FPropItem, Dialog, dcShow) then
         begin
           { The items can be rebuilt while the dialog is shown (eg by a timer calling
-            UpdateProperties): FPropItem is then the rebuilt item, or nil if it is gone. }
-          if Assigned(FPropItem) then
+            UpdateProperties): FPropItem is then the rebuilt item, or nil if it is gone.
+            Its object can also have been replaced. }
+          if Assigned(FPropItem) and (FPropItem^.Instance <> nil) then
           begin
             DialogCode(FPropItem, Dialog, dcFinished);
             Value := DialogResultValue(FPropItem, Dialog);
@@ -5030,7 +5117,16 @@ begin
   if Assigned(FList) then
     if IsWindowVisible(FList.Handle) then
       HideList;
-  DoSetValueFromEdit;
+  try
+    DoSetValueFromEdit;
+  except
+    { Rejected text (an invalid value, or the setter raised) used to stay in the
+      editor while the property kept its old value, so the row looked as if the edit
+      had worked. Show the current value again, then report the error as before. Enter
+      still leaves the text in place, to be corrected while the editor has focus. }
+    UpdateEditText;
+    raise;
+  end;
 end;
 
 procedure TzPropInspEdit.WMLBUTTONDBLCLK(var Message: TWMLBUTTONDBLCLK);
@@ -5223,6 +5319,7 @@ var
   Value: TValue;
   i: Integer;
   Root: TComponent;
+  instance: TObject;
   procedure GetMethodsItems;
   var
     LCtx: TRttiContext;
@@ -5243,7 +5340,10 @@ var
   end;
 
 begin
-  Value := PItem.Prop.GetValue(PItem.Instance);
+  instance := PItem.Instance;
+  if instance = nil then
+    Exit; // the row's object was replaced (see TPropItem.GetInstance)
+  Value := PItem.Prop.GetValue(instance);
   Root := PItem.RootComponent;
   if Value.TypeInfo = TypeInfo(TColor) then
     Exit;
@@ -5286,6 +5386,8 @@ var
   Val: TValue;
 begin
   Result := TValue.Empty;
+  if PItem.Instance = nil then
+    Exit; // the row's object was replaced (see TPropItem.GetInstance)
   Val := PItem.Value;
   case GetValueType(PItem) of
     vtMethod:
@@ -5667,8 +5769,12 @@ begin
 end;
 
 class procedure TzCustomValueManager.SetValue(const PItem: PPropItem; var Value: TValue);
+var
+  instance: TObject;
 begin
-  PItem^.Prop.SetValue(PItem.Instance, Value);
+  instance := PItem^.Instance;
+  if instance <> nil then // nil: the row's object was replaced (see TPropItem.GetInstance)
+    PItem^.Prop.SetValue(instance, Value);
 end;
 
 class function TzCustomValueManager.StrToValue<T>(const PItem: PPropItem; const s: string): T;

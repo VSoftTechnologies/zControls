@@ -2496,6 +2496,346 @@ begin
   end;
 end;
 
+{ ---- batch 5 ---- }
+
+type
+  TSwapLeaf = class(TPersistent)
+  private
+    FText: string;
+  published
+    property Text: string read FText write FText;
+  end;
+
+  TSwapChild = class(TPersistent)
+  private
+    FText: string;
+    FLeaf: TSwapLeaf;
+  public
+    constructor Create(const text: string);
+    destructor Destroy; override;
+  published
+    property Text: string read FText write FText;
+    property Leaf: TSwapLeaf read FLeaf;
+  end;
+
+  { An object property whose object the program frees and replaces, as a setter that
+    frees the old object does. }
+  TSwapHolder = class(TPersistent)
+  private
+    FChild: TSwapChild;
+  public
+    constructor Create(const text: string);
+    destructor Destroy; override;
+    procedure Replace(const text: string);
+  published
+    property Child: TSwapChild read FChild;
+  end;
+
+  { A getter that returns a new object on every read. }
+  TFreshHolder = class(TPersistent)
+  private
+    FMade: TObjectList<TSwapChild>;
+    function GetFresh: TSwapChild;
+  public
+    constructor Create;
+    destructor Destroy; override;
+  published
+    property Fresh: TSwapChild read GetFresh;
+  end;
+
+  TSelectHandlers = class
+  public
+    FInspector: TzObjectInspector;
+    FCollapse: string; // a row to collapse from inside OnSelectItem, once
+    function SelectItem(Sender: TControl; PItem: PPropItem): Boolean;
+  end;
+
+constructor TSwapChild.Create(const text: string);
+begin
+  inherited Create;
+  FText := text;
+  FLeaf := TSwapLeaf.Create;
+  FLeaf.Text := text + ' leaf';
+end;
+
+destructor TSwapChild.Destroy;
+begin
+  FLeaf.Free;
+  inherited;
+end;
+
+constructor TSwapHolder.Create(const text: string);
+begin
+  inherited Create;
+  FChild := TSwapChild.Create(text);
+end;
+
+destructor TSwapHolder.Destroy;
+begin
+  FChild.Free;
+  inherited;
+end;
+
+procedure TSwapHolder.Replace(const text: string);
+begin
+  FChild.Free;
+  FChild := TSwapChild.Create(text);
+end;
+
+constructor TFreshHolder.Create;
+begin
+  inherited Create;
+  FMade := TObjectList<TSwapChild>.Create;
+end;
+
+destructor TFreshHolder.Destroy;
+begin
+  FMade.Free;
+  inherited;
+end;
+
+function TFreshHolder.GetFresh: TSwapChild;
+begin
+  result := TSwapChild.Create('fresh');
+  FMade.Add(result);
+end;
+
+function TSelectHandlers.SelectItem(Sender: TControl; PItem: PPropItem): Boolean;
+var
+  item: PPropItem;
+begin
+  result := True;
+  if FCollapse <> '' then
+  begin
+    item := FindTopItem(FInspector, FCollapse);
+    FCollapse := '';
+    FInspector.CollapseItem(item); // rebuilds the items, so PItem is freed
+  end;
+end;
+
+function RebuildPosted(insp: TzObjectInspector): Boolean;
+var
+  msg: TMsg;
+begin
+  result := PeekMessage(msg, insp.Handle, ZCM_REBUILDITEMS, ZCM_REBUILDITEMS, PM_NOREMOVE);
+end;
+
+function SwapRow(insp: TzObjectInspector; const name: string): PPropItem;
+var
+  child: PPropItem;
+begin
+  child := FindTopItem(insp, 'Child');
+  if name = 'Leaf.Text' then
+    result := FindChild(insp, FindChild(insp, child, 'Leaf'), 'Text')
+  else
+    result := FindChild(insp, child, name);
+end;
+
+procedure ExpandSwapRows(insp: TzObjectInspector);
+begin
+  insp.ExpandItem(FindTopItem(insp, 'Child'));
+  insp.ExpandItem(SwapRow(insp, 'Leaf'));
+end;
+
+procedure TestReplacedObjectIsNotRead(form: TForm; insp: TzObjectInspector);
+var
+  holder: TSwapHolder;
+  text, leafText: PPropItem;
+begin
+  holder := TSwapHolder.Create('first');
+  try
+    insp.Component := holder;
+    ExpandSwapRows(insp);
+    text := SwapRow(insp, 'Text');
+    leafText := SwapRow(insp, 'Leaf.Text');
+    if (text = nil) or (leafText = nil) then
+    begin
+      Check(False, 'Child.Text and Child.Leaf.Text rows exist');
+      Exit;
+    end;
+    Check((text^.ValueName = 'first') and (leafText^.ValueName = 'first leaf'), 'the rows show the child''s values');
+    holder.Replace('second');
+    { Every read below used to go to the freed child: with PoisonMM, reading its
+      string is an access violation. }
+    PaintInspector(insp);
+    Check(text^.Instance = nil, 'a row of the replaced object reads nil');
+    Check(leafText^.Instance = nil, 'and so does a row of an object inside it, without reading the freed one');
+    Check((text^.ValueName = '') and (leafText^.ValueName = ''), 'neither shows a value');
+    Check(RebuildPosted(insp), 'a rebuild is posted');
+    Application.ProcessMessages;
+    text := SwapRow(insp, 'Text');
+    leafText := SwapRow(insp, 'Leaf.Text');
+    Check((text <> nil) and (text^.ValueName = 'second'), 'the rebuild shows the new child');
+    Check((leafText <> nil) and (leafText^.ValueName = 'second leaf'), 'with its rows expanded as before');
+  finally
+    insp.Component := nil;
+    holder.Free;
+  end;
+end;
+
+procedure TestReplacedObjectEditorText(form: TForm; insp: TzObjectInspector);
+var
+  holder: TSwapHolder;
+  text: PPropItem;
+  edit: TzPropInspEdit;
+  other: TEdit;
+begin
+  other := NewOtherEdit(form);
+  holder := TSwapHolder.Create('first');
+  try
+    insp.Component := holder;
+    ExpandSwapRows(insp);
+    text := SwapRow(insp, 'Text');
+    if text = nil then
+    begin
+      Check(False, 'Child.Text row exists');
+      Exit;
+    end;
+    insp.SetFocus;
+    insp.SelectItem(insp.VisibleItems.IndexOf(text));
+    edit := FindEdit(insp);
+    Check(Assigned(edit) and edit.Visible, 'editor on Child.Text');
+    if edit = nil then
+      Exit;
+    TypeText(edit, 'typed');
+    holder.Replace('second');
+    other.SetFocus; // WM_KILLFOCUS commits the typed text
+    Check(holder.Child.Text = 'second', 'text typed for the replaced child is dropped, not written to the new one');
+    Application.ProcessMessages;
+    text := SwapRow(insp, 'Text');
+    Check((text <> nil) and (text^.ValueName = 'second'), 'the rebuild shows the new child');
+  finally
+    insp.Component := nil;
+    holder.Free;
+    other.Free;
+  end;
+end;
+
+procedure TestNewObjectOnEveryRead(form: TForm; insp: TzObjectInspector);
+var
+  holder: TFreshHolder;
+  i, posts: Integer;
+  msg: TMsg;
+begin
+  holder := TFreshHolder.Create;
+  try
+    insp.Component := holder;
+    insp.ExpandItem(FindTopItem(insp, 'Fresh'));
+    Check(FindChild(insp, FindTopItem(insp, 'Fresh'), 'Text') <> nil, 'Fresh expanded');
+    { Only the rebuild message is dispatched, a fixed number of times: with
+      ProcessMessages, a rebuild after every paint never ends and the run hangs. }
+    posts := 0;
+    for i := 1 to 3 do
+    begin
+      PaintInspector(insp);
+      while PeekMessage(msg, insp.Handle, ZCM_REBUILDITEMS, ZCM_REBUILDITEMS, PM_REMOVE) do
+      begin
+        Inc(posts);
+        DispatchMessage(msg);
+      end;
+    end;
+    Check(posts = 0, Format('no rebuild is posted for a getter that returns a new object on every read: ' +
+      'it would repeat after every paint (%d posted)', [posts]));
+  finally
+    insp.Component := nil;
+    holder.Free;
+  end;
+end;
+
+procedure TestSelectHandlerThatRebuilds(form: TForm; insp: TzObjectInspector);
+var
+  btn: TButton;
+  handlers: TSelectHandlers;
+  last: string;
+  edit: TzPropInspEdit;
+  caret: TPoint;
+  index: Integer;
+begin
+  btn := TButton.Create(nil);
+  btn.Parent := form;
+  btn.Left := 17;
+  handlers := TSelectHandlers.Create;
+  try
+    handlers.FInspector := insp;
+    insp.Component := btn;
+    insp.OnSelectItem := handlers.SelectItem;
+    insp.SetFocus;
+
+    { Left is below Font, so collapsing Font moves it up. }
+    insp.ExpandItem(FindTopItem(insp, 'Font'));
+    handlers.FCollapse := 'Font';
+    insp.SelectItem(insp.VisibleItems.IndexOf(FindTopItem(insp, 'Left')));
+    Check((insp.SelectedItem <> nil) and (insp.SelectedItem^.Name = 'Left'),
+      'the row asked for is selected after the handler collapsed a row above it');
+    edit := FindEdit(insp);
+    Check(Assigned(edit) and (edit.Text = '17'), 'and the editor shows its value');
+
+    { The last row: its index was past the end of the list after the collapse. }
+    insp.ExpandItem(FindTopItem(insp, 'Font'));
+    handlers.FCollapse := 'Font';
+    last := insp.VisibleItems[insp.VisibleItems.Count - 1]^.QualifiedName;
+    insp.SelectItem(insp.VisibleItems.Count - 1);
+    Check((insp.SelectedItem <> nil) and (insp.SelectedItem^.QualifiedName = last), 'the last row is selected');
+
+    { Search: typing a name selects the row, and the caret goes on it. }
+    insp.ExpandItem(FindTopItem(insp, 'Font'));
+    edit := SelectRow(insp, 'Caption');
+    if edit = nil then
+      Exit;
+    PostKey(edit.Handle, VK_TAB);
+    Check(GetFocus = insp.Handle, 'searching');
+    handlers.FCollapse := 'Font';
+    PostKey(insp.Handle, Ord('L'));
+    Check((insp.SelectedItem <> nil) and (insp.SelectedItem^.Name = 'Left'), 'typing L selects Left');
+    index := insp.VisibleItems.IndexOf(FindTopItem(insp, 'Left'));
+    GetCaretPos(caret);
+    Check((index >= 0) and (caret.Y = insp.ItemRect[index].Top + 1), 'the caret is on that row');
+  finally
+    insp.OnSelectItem := nil;
+    insp.Component := nil;
+    handlers.Free;
+    btn.Free;
+  end;
+end;
+
+procedure TestRejectedTextRevertsOnFocusLoss(form: TForm; insp: TzObjectInspector);
+var
+  btn: TButton;
+  other: TEdit;
+  edit: TzPropInspEdit;
+begin
+  other := NewOtherEdit(form);
+  btn := TButton.Create(nil);
+  btn.Parent := form;
+  try
+    insp.Component := btn;
+    edit := SelectRow(insp, 'Default'); // Boolean: only False/True are accepted
+    if edit = nil then
+      Exit;
+    TypeText(edit, 'xyz');
+    expectedExceptions := 1;
+    other.SetFocus; // WM_KILLFOCUS commits the text, which is rejected
+    Check(expectedExceptions = 0, 'rejected text reported');
+    expectedExceptions := 0;
+    Check(not btn.Default, 'value unchanged');
+    Check(edit.Text = 'False', 'the editor shows the current value again, not the rejected text: ' + edit.Text);
+
+    edit.SetFocus;
+    edit.SelectAll;
+    TypeText(edit, 'xyz');
+    expectedExceptions := 1;
+    PostKey(edit.Handle, VK_RETURN);
+    Check(expectedExceptions = 0, 'Enter reports rejected text too');
+    expectedExceptions := 0;
+    Check(edit.Text = 'xyz', 'and leaves it in the editor to be corrected');
+  finally
+    expectedExceptions := 0;
+    insp.Component := nil;
+    btn.Free;
+    other.Free;
+  end;
+end;
+
 { ---- crash #7: system-wide Tab hotkey ---- }
 
 function GlobalTabHotkeyFree: Boolean;
@@ -2767,6 +3107,13 @@ begin
     Run('Count and Items follow the parent links', form, TestChildLinks);
     Run('Dotted line pixels', form, TestDrawHorzDotLinePixels);
     Run('The dropdown button follows the editor', form, TestButtonFollowsEditor);
+    Writeln;
+    Writeln('---- batch 5 ----');
+    Run('Rows of a replaced object are not read', form, TestReplacedObjectIsNotRead);
+    Run('Text typed for a replaced object is dropped', form, TestReplacedObjectEditorText);
+    Run('A getter that returns a new object on every read', form, TestNewObjectOnEveryRead);
+    Run('An OnSelectItem handler that rebuilds the items', form, TestSelectHandlerThatRebuilds);
+    Run('Rejected text is replaced by the value on focus loss', form, TestRejectedTextRevertsOnFocusLoss);
   finally
     form.Free;
     Application.OnException := nil;
