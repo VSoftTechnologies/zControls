@@ -25,7 +25,8 @@ uses
   Testing.Inspector in 'Testing.Inspector.pas',
   Tests.Crashes in 'Tests.Crashes.pas',
   Tests.Values in 'Tests.Values.pas',
-  Tests.Fixes in 'Tests.Fixes.pas';
+  Tests.Fixes in 'Tests.Fixes.pas',
+  Tests.TextHooks in 'Tests.TextHooks.pas';
 
 {$IFNDEF TESTINSIGHT}
 var

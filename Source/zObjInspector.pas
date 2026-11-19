@@ -272,6 +272,15 @@ type
     /// <summary> Check if item can assign value that is not listed in ListBox .
     /// </summary>
     class function ValueHasOpenProbabilities(const PItem: PPropItem): Boolean; virtual;
+    { Whether a row of a class type (other than a component reference) takes typed
+      text. False, as before: such a row is edited through its own rows or a dialog. }
+    class function EditsAsText(const PItem: PPropItem): Boolean; virtual;
+    { Turns typed text into the value to set, before the inspector's own parsing.
+      False leaves the text to it. The value goes to OnItemSetValue and then to
+      SetValue, which writes only a value of the property's own type: a manager that
+      returns another type sets the property itself, in OnItemSetValue. }
+    class function TryTextToValue(const PItem: PPropItem; const Text: string;
+      var Value: TValue): Boolean; virtual;
     /// <summary> Check if value has an ExtraRect like (Color,Boolean)type .
     /// </summary>
     /// <returns> non zero to indicate that value must use an ExtraRect .
@@ -4663,6 +4672,13 @@ begin
   s := Text;
   if Trim(FPropItem^.ValueName) = Trim(s) then
     Exit;
+  { The value manager may read the text itself, eg a colour as '#RRGGBB' }
+  if DefaultValueManager.TryTextToValue(FPropItem, s, Value) then
+  begin
+    FInspector.DoSetValue(FPropItem, Value);
+    SelectAll;
+    Exit;
+  end;
   if s = '' then
   begin
     vUInt := 0;
@@ -4744,7 +4760,8 @@ begin
       Component references used to be read-only as well, so their dropdown listed
       the form's components but could not set one. }
     if FPropItem^.IsSet or
-      (FPropItem^.IsClass and not IsPropTypeDerivedFromClass(FPropItem^.Prop.PropertyType, TComponent)) then
+      (FPropItem^.IsClass and not IsPropTypeDerivedFromClass(FPropItem^.Prop.PropertyType, TComponent) and
+      not DefaultValueManager.EditsAsText(FPropItem)) then
       ReadOnly := True;
   end;
   if not ReadOnly then
@@ -6002,6 +6019,17 @@ begin
     vtColor, vtString, vtUnknown:
       Exit(True);
   end;
+end;
+
+class function TzCustomValueManager.EditsAsText(const PItem: PPropItem): Boolean;
+begin
+  Result := False;
+end;
+
+class function TzCustomValueManager.TryTextToValue(const PItem: PPropItem; const Text: string;
+  var Value: TValue): Boolean;
+begin
+  Result := False;
 end;
 
 { TzPropInspButton }

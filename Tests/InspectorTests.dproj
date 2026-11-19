@@ -85,6 +85,7 @@
         <DCCReference Include="Tests.Crashes.pas"/>
         <DCCReference Include="Tests.Values.pas"/>
         <DCCReference Include="Tests.Fixes.pas"/>
+        <DCCReference Include="Tests.TextHooks.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

@@ -1,7 +1,7 @@
 # DPM package spec file
 metadata:
   id: VSoft.zControls
-  version: 1.0.0
+  version: 1.0.1
   description: Object Inspector component for delphi
   authors:
     - Mahdi Safsafi
